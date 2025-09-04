@@ -54,9 +54,6 @@ See `tests/test_api.py::test_enforcement_flow()` for a working pattern.
 
 ## Compliance Pack
 
-Use the `spcp.receipts.pack` helpers (or wire into your CLI) to bundle receipts + STH + a tiny verifier script into a ZIP an auditor can run offline.
-
-## Supply-chain hardening
 
 - `dependabot.yml`, `SECURITY.md`, CI with code quality & tests configured with **least-privilege token permissions**.
 - You should **pin GitHub Actions by full commit SHA** using your existing pinning script before enabling required checks.
@@ -64,8 +61,6 @@ Use the `spcp.receipts.pack` helpers (or wire into your CLI) to bundle receipts 
 ## License
 
 Apache-2.0
-
-## PQC TLS Sidecar (Experimental)
 
 An experimental NGINX + OpenSSL 3 + OQS provider TLS terminator lives in `terminators/nginx-oqs/`.
 It builds `liboqs` and `oqs-provider`, auto-loads the provider via `openssl.cnf`, and exposes a
@@ -102,14 +97,6 @@ Each stored receipt internally uses `kind`. API responses also project outward c
 - `type`: alias of `kind`
 - `time`: RFC3339 derived from `ts_ms`
 - `policy_id`: alias of `policy_version`
-- `decision`: flattened string ("allow"/"deny") plus original object under `decision`
-- `negotiated_raw`: full original negotiated structure
-- `negotiated_summary`: condensed `{ protocol, kex_group, sigalg, cipher }`
-- `signature_b64`, `signer_kid`: signature and short key identifier
-- `prev_receipt_hash_b64`: hash link
-
-Malformed JSON files in the receipts directory are ignored for STH and `/receipts/latest`.
-
 Health endpoints: `/health` and `/healthz`.
 
 ## Integration Test (Optional)
@@ -117,6 +104,37 @@ Health endpoints: `/health` and `/healthz`.
 A two-phase integration test exercises an allow event then a restricted proxy phase. Enable with `RUN_INT=1`:
 
 ```powershell
+
+## TLS Terminator Integration (MVP)
+
+An NGINX-based TLS front end can inject the negotiated tuple into the control plane via headers
+and/or structured access logs. Two configs are provided:
+
+- `docker/nginx/nginx.default.conf` – standard hybrid-capable stack (placeholder hybrid mapping).
+- `docker/nginx/nginx.restricted.conf` – restricted groups to force deny receipts.
+
+The `handshake_tailer.py` script (under `terminators/nginx-oqs/`) can be run as a sidecar to tail
+`/var/log/nginx/handshake.log` (log_format `handshake`) and POST `pqc.enforcement` allow receipts
+representing the effective negotiated tuple observed on real connections. Policy denial continues
+to be enforced server-side (soft mode) until a direct enforcement channel is wired.
+
+Example docker snippet:
+
+```
+  tailer:
+    image: python:3.12-slim
+    volumes:
+      - ./docker/nginx/logs:/var/log/nginx:ro
+    working_dir: /app
+    command: ["python","/mount/handshake_tailer.py"]
+    volumes:
+      - ./terminators/nginx-oqs/handshake_tailer.py:/mount/handshake_tailer.py:ro
+    environment:
+      CONTROL_PLANE_URL: http://app:8000
+```
+
+Future enhancements: extract actual signature/KEM algorithms from oqs-provider enabled OpenSSL,
+and push policy decisions down into dynamic NGINX variables for pre-TLS enforcement.
 make int-test
 ```
 
