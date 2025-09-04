@@ -6,7 +6,7 @@ import hashlib
 import json
 from pathlib import Path
 
-from fastapi import Body, FastAPI, HTTPException, Request
+from fastapi import Body, FastAPI, HTTPException, Request, Response
 
 from ..policy.circuit_breaker import CircuitBreaker
 from ..policy.store import load_policy, set_policy
@@ -116,6 +116,58 @@ def extract_handshake_tuple(headers: dict) -> dict:
     }
 
 
+def _compute_policy_hash(doc: PolicyDoc) -> str:
+    """Deterministic hash (base64 sha256) of the policy doc for receipts."""
+    core = doc.model_dump()
+    payload = json.dumps(core, sort_keys=True, separators=(",", ":")).encode()
+    return base64.b64encode(hashlib.sha256(payload).digest()).decode()
+
+
+@app.middleware("http")
+async def soft_policy_enforcer(request: Request, call_next):  # pragma: no cover (separate test may cover)
+    path = request.url.path
+    # Skip control endpoints
+    if path.startswith("/events") or path.startswith("/policy") or path.startswith("/health"):
+        return await call_next(request)
+    # If no other application routes exist, this will rarely trigger; placeholder for integration.
+    negotiated = extract_handshake_tuple(request.headers)
+    group = negotiated.get("group_or_kem")
+    policy = load_policy()
+    deny_reason: str | None = None
+    if group is None:
+        deny_reason = "missing_group"
+    elif group in policy.deny_groups:
+        deny_reason = "explicit_deny"
+    elif policy.allow_groups and group not in policy.allow_groups:
+        deny_reason = "not_in_allowlist"
+
+    if deny_reason:
+        # Emit a deny enforcement receipt representing a soft validation failure
+        sk, _ = _load_keys()
+        rec = {
+            "kind": "pqc.enforcement",
+            "ts_ms": int(time.time() * 1000),
+            "policy_version": policy.version,
+            "policy_hash_b64": _compute_policy_hash(policy),
+            "negotiated": negotiated,
+            "decision": {"allow": False, "reason": deny_reason},
+            "prev_receipt_hash_b64": _read_prev_hash(),
+        }
+        signed = sign_receipt_ed25519(rec, sk)
+        hash_prefix = signed["payload_hash_b64"][:8].replace("/", "_").replace("+", "-")
+        _store_signed_receipt(f"pqc_enforcement_{hash_prefix}", signed)
+        _refresh_sth()
+        return Response(
+            status_code=403,
+            media_type="application/json",
+            content=json.dumps({
+                "detail": "pqc policy violation",
+                "reason": deny_reason,
+            }),
+        )
+    return await call_next(request)
+
+
 @app.post("/events")
 def post_event(request: Request, body: dict = Body(...)):  # noqa: B008 FastAPI dependency pattern
     sk, vk = _load_keys()
@@ -146,3 +198,9 @@ def post_event(request: Request, body: dict = Body(...)):  # noqa: B008 FastAPI 
             _refresh_sth()
 
     return signed
+
+
+@app.get("/echo")
+def echo():
+    """Simple placeholder application route subject to soft policy enforcement."""
+    return {"ok": True}
