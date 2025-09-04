@@ -37,7 +37,7 @@ jobs:
           sarif_file: results.sarif
       - name: Upload Scorecard results artifact (optional)
         if: always()
-        uses: actions/upload-artifact@834a144ee995460fba8ed112a2fc961b36a5ec5a # v4.4.0 pinned
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.4.0 pinned
         with:
           name: scorecard-results
           path: results.sarif
