@@ -9,7 +9,7 @@ RFC3339_FORMAT = "%Y-%m-%dT%H:%M:%S.%fZ"
 
 
 def _now_rfc3339() -> str:
-    # Truncate microseconds to milliseconds for shorter string while valid RFC3339 fraction (3-6 digits allowed)
+    # Truncate microseconds to milliseconds; RFC3339 allows 3-6 fractional digits
     now = dt.datetime.utcnow().replace(tzinfo=dt.timezone.utc)
     return now.isoformat().replace("+00:00", "Z")
 
@@ -50,7 +50,7 @@ def _add_content_digest(prepared_request) -> str | None:
         body_bytes = body.encode("utf-8")
     else:
         body_bytes = body
-    # For simplicity, use sha-256 as content digest algorithm (matches server expectation if any)
+    # Use sha-256 as content digest algorithm (matches server expectation)
     import hashlib
 
     digest = hashlib.sha256(body_bytes).digest()
@@ -128,9 +128,9 @@ def sign_http_request(
     # Simple approach: try to extract base64 payload lines and decode; if 32 bytes use as seed.
     key_material = ed25519_private_key_pem.strip()
     if "BEGIN" in key_material:
-        # PEM format
-    pem_lines = [line for line in key_material.splitlines() if not line.startswith("---")]  # drop headers
-    b64_join = "".join(pem_lines)
+        # PEM format: strip header/footer lines then base64-decode
+        pem_lines = [line for line in key_material.splitlines() if not line.startswith("---")]  # drop headers
+        b64_join = "".join(pem_lines)
         try:
             raw = base64.b64decode(b64_join)
             # PKCS8 Ed25519 private key structure: last 32 bytes typically the seed

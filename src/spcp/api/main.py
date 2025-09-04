@@ -1,17 +1,22 @@
 from __future__ import annotations
 
 import base64
+import fnmatch
 import hashlib
+import io
 import json
 import logging
 import os
+import secrets
 import time
-from pathlib import Path
-import io
 import zipfile
+from collections import OrderedDict
+from pathlib import Path
 
 from fastapi import Body, FastAPI, HTTPException, Request, Response
 
+from ..cbom.collector import collect_cbom
+from ..pch.auth import get_channel_binding, parse_pch_authorization
 from ..policy.circuit_breaker import CircuitBreaker
 from ..policy.store import load_policy, set_policy
 from ..policy.tuple_policy import evaluate_tuple_policy, load_tuple_policy, set_tuple_policy
@@ -19,12 +24,6 @@ from ..receipts.merkle import build_sth
 from ..receipts.sign import sign_receipt_ed25519
 from ..settings import settings
 from .models import PolicyDoc, PQCCBOMReceipt, PQCEnforcementReceipt
-from ..cbom.collector import collect_cbom
-from ..pch.verify import verify_pch
-from ..pch.auth import parse_pch_authorization, get_channel_binding
-import secrets
-from collections import OrderedDict
-import fnmatch
 
 # Metrics (simple counters; replace with real Prometheus client in production)
 _metrics = {
@@ -172,14 +171,17 @@ class _TupleNonceCache:
     def issue(self, client_ip: str, route: str, binding: str) -> str:
         nonce = base64.b64encode(secrets.token_bytes(16)).decode()
         k = self._key(client_ip, route, binding, nonce)
-        now = time.time(); self._prune(now)
-        self._data[k] = now; self._data.move_to_end(k)
+        now = time.time()
+        self._prune(now)
+        self._data[k] = now
+        self._data.move_to_end(k)
         if len(self._data) > self.max_size:
             self._data.popitem(last=False)
         return nonce
 
     def consume(self, client_ip: str, route: str, binding: str, nonce: str) -> bool:
-        now = time.time(); self._prune(now)
+        now = time.time()
+        self._prune(now)
         k = self._key(client_ip, route, binding, nonce)
         if k in self._data:
             self._data.pop(k, None)
@@ -437,11 +439,13 @@ def _verify_pch_request(request: Request, policy: PolicyDoc) -> tuple[bool, dict
     challenge_b64 = params.get("challenge")
     pch_block["challenge"] = challenge_b64
     try:
-        challenge_raw = base64.b64decode(challenge_b64 or "")
+        base64.b64decode(challenge_b64 or "")
     except Exception:
-        pch_block["failure_reason"] = "bad_challenge_b64"; return (False, pch_block)
+        pch_block["failure_reason"] = "bad_challenge_b64"
+        return (False, pch_block)
     if not _pch_nonce_cache.verify(challenge_b64):
-        pch_block["failure_reason"] = "stale_or_unknown_challenge"; return (False, pch_block)
+        pch_block["failure_reason"] = "stale_or_unknown_challenge"
+        return (False, pch_block)
     # Channel binding
     chan_kind, chan_raw, chan_header = get_channel_binding(request)
     if chan_header:
@@ -451,13 +455,15 @@ def _verify_pch_request(request: Request, policy: PolicyDoc) -> tuple[bool, dict
             if tls_session_id:
                 expected = base64.b64encode(tls_session_id.encode()).decode()
             if not expected or expected != chan_header.split(":",1)[1]:
-                pch_block["failure_reason"] = "channel_binding_mismatch"; return (False, pch_block)
+                pch_block["failure_reason"] = "channel_binding_mismatch"
+                return (False, pch_block)
         elif chan_kind == "tls-exporter":
             expected = None
             if tls_exporter:
                 expected = base64.b64encode(tls_exporter.encode()).decode()
             if not expected or expected != chan_header.split(":",1)[1]:
-                pch_block["failure_reason"] = "channel_binding_mismatch"; return (False, pch_block)
+                pch_block["failure_reason"] = "channel_binding_mismatch"
+                return (False, pch_block)
     # Evidence
     try:
         evidence_bytes = base64.b64decode(params.get("evidence",""))
@@ -465,9 +471,11 @@ def _verify_pch_request(request: Request, policy: PolicyDoc) -> tuple[bool, dict
         # Privacy: ensure evidence does not contain hostnames/paths (PII). Reject if keys present.
         forbidden_keys = {"host", "hostname", "path", "url"}
         if any(k in evidence for k in forbidden_keys):
-            pch_block["failure_reason"] = "evidence_disallowed_keys"; return (False, pch_block)
+            pch_block["failure_reason"] = "evidence_disallowed_keys"
+            return (False, pch_block)
     except Exception:
-        pch_block["failure_reason"] = "bad_evidence"; return (False, pch_block)
+        pch_block["failure_reason"] = "bad_evidence"
+        return (False, pch_block)
     ev_type = evidence.get("type")
     merkle_root_b64 = evidence.get("merkle_root_b64")
     cbom_hash_b64 = evidence.get("cbom_hash_b64")
@@ -487,7 +495,8 @@ def _verify_pch_request(request: Request, policy: PolicyDoc) -> tuple[bool, dict
     except Exception:
         ok_lengths = False
     if not (ev_type == "pch.sth" and ok_lengths and isinstance(policy_id, str)):
-        pch_block["failure_reason"] = "invalid_evidence"; return (False, pch_block)
+        pch_block["failure_reason"] = "invalid_evidence"
+        return (False, pch_block)
     # Only retain minimal reference fields to keep header-derived data small and privacy-preserving.
     pch_block["evidence_ref"] = {"type": ev_type, "merkle_root_b64": merkle_root_b64, "cbom_hash_b64": cbom_hash_b64, "policy_id": policy_id}
     # Signature base (HTTP Message Signatures subset)
@@ -511,7 +520,8 @@ def _verify_pch_request(request: Request, policy: PolicyDoc) -> tuple[bool, dict
     sig_input = "\n".join(covered).encode()
     # Verify signature (only ed25519 supported in requirement)
     if params.get("alg","ed25519").lower() != "ed25519":
-        pch_block["failure_reason"] = "unsupported_alg"; return (False, pch_block)
+        pch_block["failure_reason"] = "unsupported_alg"
+        return (False, pch_block)
     try:
         from nacl.signing import VerifyKey
         vk_b64 = params.get("keyId","")
@@ -522,7 +532,8 @@ def _verify_pch_request(request: Request, policy: PolicyDoc) -> tuple[bool, dict
         pch_block["key_id_b64"] = vk_b64
         pch_block["signature_b64"] = params.get("signature")
     except Exception:
-        pch_block["failure_reason"] = "bad_signature"; return (False, pch_block)
+        pch_block["failure_reason"] = "bad_signature"
+        return (False, pch_block)
     pch_block["verified"] = True
     return (True, pch_block)
 
@@ -743,7 +754,7 @@ async def pch_enforcer(request: Request, call_next):  # pragma: no cover - new l
         return Response(status_code=403, media_type="application/json", content=json.dumps({"reason":"missing_signature_input"}))
     # Very small parser for: sig1=("@method" "@path" ...);created=...
     try:
-        prefix, rest = sig_input_header.split("=",1)
+        _prefix, rest = sig_input_header.split("=",1)
         paren_start = rest.find("(")
         paren_end = rest.find(")", paren_start+1)
         inner = rest[paren_start+1:paren_end]
@@ -1000,8 +1011,8 @@ def get_latest_receipt(type: str | None = None, require_pch: bool = False, raw: 
                 continue
             if raw:
                 # Return stored JSON as-is (except ensure 'kind' present if only 'type').
-                if 'kind' not in obj and 'type' in obj:
-                    obj['kind'] = obj['type']
+                if "kind" not in obj and "type" in obj:
+                    obj["kind"] = obj["type"]
                 return obj
             else:
                 shaped = _outward_enforcement_shape(obj) if obj.get("kind") == "pqc.enforcement" else _outward_cbom_shape(obj)

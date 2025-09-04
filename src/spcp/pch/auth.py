@@ -4,13 +4,11 @@ import base64
 
 
 def parse_pch_authorization(header_value: str) -> dict[str, str]:
-        """Parse a ``Authorization: PCH`` header into parameters.
+    """Parse an Authorization: PCH header into a dict.
 
-        Expected token list (order not strict):
-            PCH keyId="<b64pub>", alg="ed25519", created="<epoch>", challenge="<nonce>", evidence="<b64>", signature="<b64>"
-
-        Returns empty dict on parse failure or non-PCH scheme.
-        """
+    Fields (order not strict): keyId, alg, created, challenge, evidence, signature.
+    Returns empty dict on parse failure or non-PCH scheme.
+    """
     if not header_value:
         return {}
     parts = header_value.split(" ", 1)
@@ -26,13 +24,7 @@ def parse_pch_authorization(header_value: str) -> dict[str, str]:
 
 
 def get_channel_binding(request) -> tuple[str | None, bytes | None, str | None]:
-    """Extract and decode channel binding from headers.
-
-    Looks at 'PCH-Channel-Binding'. Format:
-        tls-session-id:<b64> or tls-exporter:<b64>
-
-    Returns (kind, raw_bytes, original_header_value) or (None, None, None).
-    """
+    """Decode channel binding header (tls-session-id or tls-exporter)."""
     hdr = request.headers.get("pch-channel-binding")
     if not hdr:
         return None, None, None
