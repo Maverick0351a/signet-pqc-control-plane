@@ -3,13 +3,11 @@ from __future__ import annotations
 import base64
 import fnmatch
 import hashlib
-import io
 import json
 import logging
 import os
 import secrets
 import time
-import zipfile
 from collections import OrderedDict
 from pathlib import Path
 
@@ -661,6 +659,14 @@ def _route_requires_pch(path: str) -> bool:
     return False
 
 
+def _route_requires_sig(path: str) -> bool:
+    patterns = settings.signature_required_routes or []
+    for pat in patterns:
+        if fnmatch.fnmatch(path, pat):
+            return True
+    return False
+
+
 def _parse_signature_header(sig_input: str) -> dict | None:
     # Expect shape: keyId="...",alg="ed25519",created="<int>",headers="@method @path ...",signature="b64"
     try:
@@ -1067,140 +1073,175 @@ def collect_cbom_now():  # pragma: no cover - simple IO orchestration
     return _outward_cbom_shape(signed)
 
 
-@app.get("/compliance/pack")
-@app.post("/compliance/pack")
-def get_compliance_pack(since: int | None = None):  # pragma: no cover - IO heavy
-    """Return a ZIP compliance bundle.
+################################################################################################
+# RFC 9421 HTTP Message Signatures Enforcement Middleware (minimal subset)
+################################################################################################
 
-    Default (no since parameter): legacy pack (sth.json + last 50 enforcement receipts + proofs + verify script).
-    With ?since=<ts>: new format containing:
-      - STH.json (latest Signed Tree Head; capitalized name per requirement)
-      - receipts.jsonl (newline-delimited JSON of receipts with ts_ms >= since)
-      - proofs/ (all proof json files present; future: filter to those receipts)
-      - verify.py (offline chain + optional PCH verifier)
+def _route_requires_signature(path: str) -> bool:
+    for pat in settings.signature_required_routes:
+        if fnmatch.fnmatch(path, pat):
+            return True
+    return False
 
-    The `since` timestamp is interpreted as milliseconds if >= 1e12 else seconds.
-    """
-    DATA.mkdir(parents=True, exist_ok=True)
-    RECEIPTS.mkdir(parents=True, exist_ok=True)
-    PROOFS.mkdir(parents=True, exist_ok=True)
-    buf = io.BytesIO()
-    # Determine latest STH source (batched sth directory takes precedence if present)
-    sth_dir = DATA / "sth"
-    latest_sth_path: Path | None = None
-    if sth_dir.exists():
-        sth_files = sorted(sth_dir.glob("sth_*.json"), key=lambda p: p.stat().st_mtime)
-        if sth_files:
-            latest_sth_path = sth_files[-1]
-    if latest_sth_path is None and STH_FILE.exists():  # fallback to legacy single STH
-        latest_sth_path = STH_FILE
 
-    with zipfile.ZipFile(buf, "w", compression=zipfile.ZIP_DEFLATED) as zf:
-        if since is None:
-            # Legacy packaging branch preserved for backward compatibility
-            if latest_sth_path and latest_sth_path.exists():
-                zf.write(latest_sth_path, arcname="sth.json")
-            enforcement = []
-            for r in sorted(RECEIPTS.glob("*.json"), key=lambda p: p.stat().st_mtime, reverse=True):
-                try:
-                    obj = json.loads(r.read_text())
-                except Exception as e:  # noqa: S112
-                    logging.debug("Skipping unreadable receipt during legacy pack build: %s", e)
-                if isinstance(obj, dict) and obj.get("kind") == "pqc.enforcement":
-                    enforcement.append(r)
-                if len(enforcement) >= 50:
-                    break
-            for idx, path_obj in enumerate(enforcement):
-                arcname = f"receipts/enforcement/enforcement_{idx}.json"
-                try:
-                    zf.write(path_obj, arcname=arcname)
-                except Exception:
-                    logging.exception("Failed to add enforcement receipt %s", path_obj)
-            for pth in sorted(PROOFS.glob("*.json")):
-                try:
-                    zf.write(pth, arcname=f"proofs/{pth.name}")
-                except Exception:
-                    logging.exception("Failed to add proof %s", pth)
+def _parse_signature_input(header: str) -> tuple[str, list[str], dict] | None:
+    # sig1=("@method" "@path" "@authority" "content-digest");created=123;keyid="...";alg="ed25519"
+    try:
+        label, rest = header.split("=", 1)
+        paren_start = rest.index("(")
+        paren_end = rest.index(")", paren_start + 1)
+        covered = [f.strip().strip('"') for f in rest[paren_start + 1:paren_end].split() if f.strip()]
+        params_part = rest[paren_end + 1:]
+        params: dict[str, str] = {}
+        for seg in params_part.split(";"):
+            seg = seg.strip()
+            if not seg:
+                continue
+            if "=" in seg:
+                k, v = seg.split("=", 1)
+                params[k] = v.strip().strip('"')
+        return label.strip(), covered, params
+    except Exception:  # noqa: S112
+        return None
+
+
+def _build_rfc9421_base(request: Request, covered: list[str], body_digest: str | None) -> bytes:
+    lines: list[str] = []
+    for f in covered:
+        fl = f.lower()
+        if f == "@method":
+            lines.append(f"@method:{request.method.upper()}")
+        elif f == "@path":
+            lines.append(f"@path:{request.url.path}")
+        elif f == "@authority":
+            lines.append(f"@authority:{request.headers.get('host','')}")
+        elif fl == "content-digest":
+            lines.append(f"content-digest:{body_digest or request.headers.get('content-digest','')}")
         else:
-            # New format
-            since_ms = since if since >= 1_000_000_000_000 else since * 1000  # seconds -> ms
-            if latest_sth_path and latest_sth_path.exists():
-                zf.write(latest_sth_path, arcname="STH.json")
-            # Collect receipts meeting threshold
-            receipts = []
-            for r in sorted(RECEIPTS.glob("*.json"), key=lambda p: p.stat().st_mtime):
-                try:
-                    obj = json.loads(r.read_text())
-                except Exception as e:  # noqa: S112
-                    logging.debug("Skipping unreadable receipt for since-pack: %s", e)
-                if not isinstance(obj, dict):
-                    continue
-                ts_ms = obj.get("ts_ms")
-                if ts_ms is None:
-                    # fallback to file mtime in ms
-                    ts_ms = int(r.stat().st_mtime * 1000)
-                if ts_ms >= since_ms:
-                    receipts.append(obj)
-            # Write receipts.jsonl
-            lines = []
-            for rec in receipts:
-                try:
-                    lines.append(json.dumps(rec, separators=(",", ":"), sort_keys=True))
-                except Exception as e:  # noqa: S112
-                    logging.debug("Skipping receipt serialization for jsonl: %s", e)
-            zf.writestr("receipts.jsonl", "\n".join(lines) + ("\n" if lines else ""))
-            # Proofs directory (currently unfiltered)
-            for pth in sorted(PROOFS.glob("*.json")):
-                try:
-                    zf.write(pth, arcname=f"proofs/{pth.name}")
-                except Exception:
-                    logging.exception("Failed to add proof %s", pth)
-        # Common tooling for both branches
-        verify_py = """#!/usr/bin/env python3
-import sys, json, base64, hashlib
-from pathlib import Path
+            lines.append(f"{f}:{request.headers.get(f, '')}")
+    return "\n".join(lines).encode()
 
-def load_jsonl(path):
-    for line in open(path, 'r', encoding='utf-8'):
-        line=line.strip()
-        if not line: continue
-        yield json.loads(line)
 
-def sha256_b64(data: bytes) -> str:
-    import hashlib, base64
-    return base64.b64encode(hashlib.sha256(data).digest()).decode()
+def _emit_signature_receipt(request: Request, allow: bool, reason: str | None, covered: list[str] | None):  # pragma: no cover - IO
+    try:
+        sk, _ = _load_keys()
+        pol = load_policy()
+        negotiated = extract_handshake_tuple(request.headers)
+        negotiated.setdefault("session_id", request.headers.get("x-tls-session-id"))
+        rec = {
+            "kind": "pqc.enforcement",
+            "ts_ms": int(time.time() * 1000),
+            "policy_version": pol.version,
+            "policy_hash_b64": _compute_policy_hash(pol),
+            "negotiated": negotiated,
+            "decision": {"allow": allow, **({"reason": reason} if reason else {})},
+            "route": request.url.path,
+            "caller_id": request.client.host if request.client else None,
+            "prev_receipt_hash_b64": _read_prev_hash(),
+            "binding_type": "tls-session-id" if request.headers.get("x-tls-session-id") else None,
+            "sig_fields": covered,
+        }
+        signed = sign_receipt_ed25519(rec, sk)
+        hash_prefix = signed["payload_hash_b64"][:8].replace("/", "_").replace("+", "-")
+        _store_signed_receipt(f"pqc_enforcement_{hash_prefix}", signed)
+        _refresh_sth()
+    except Exception as e:  # noqa: S112
+        logging.debug("Failed to write signature receipt: %s", e)
 
-def build_core_payload(obj):
-    # remove signature related fields to reconstruct payload for hash verification
-    excluded = {'receipt_sig_b64','sig_alg'}
-    core = {k: v for k, v in obj.items() if k not in excluded}
-    return json.dumps(core, sort_keys=True, separators=(',', ':')).encode()
 
-def verify_chain(objs):
-    prev = None
-    for idx, obj in enumerate(objs):
-        payload_hash = obj.get('payload_hash_b64')
-        calc_hash = sha256_b64(build_core_payload(obj))
-        if payload_hash != calc_hash:
-            return False, f'hash_mismatch@{idx}'
-        if prev is not None and obj.get('prev_receipt_hash_b64') not in {prev.get('payload_hash_b64'), None}:
-            return False, f'prev_link_mismatch@{idx}'
-        prev = obj
-    return True, None
-
-def main():
-    if len(sys.argv) < 2:
-        print('Usage: verify.py <receipts.jsonl>'); sys.exit(1)
-    path = Path(sys.argv[1])
-    objs = list(load_jsonl(path))
-    ok, reason = verify_chain(objs)
-    print(json.dumps({'verified': ok, 'reason': reason}))
-
-if __name__ == '__main__':
-    main()
-"""
-        zf.writestr("verify.py", verify_py)
-    buf.seek(0)
-    fname = "signet_compliance_pack.zip" if since is None else f"signet_compliance_pack_since_{since}.zip"
-    headers = {"Content-Disposition": f"attachment; filename={fname}"}
-    return Response(content=buf.getvalue(), media_type="application/zip", headers=headers)
+@app.middleware("http")
+async def http_signature_enforcer(request: Request, call_next):  # pragma: no cover (integration tested separately)
+    path = request.url.path
+    if not _route_requires_signature(path):
+        return await call_next(request)
+    # Read body for digest + size enforcement; re-inject later
+    body = await request.body()
+    body_len = len(body)
+    if body_len > settings.max_body_bytes:
+        _emit_signature_receipt(request, False, "size_exceeded", None)
+        return Response(status_code=413, media_type="application/json", content=json.dumps({"detail": "size_exceeded"}))
+    ctype = request.headers.get("content-type", "").split(";", 1)[0].strip().lower()
+    if body_len and settings.allow_content_types and ctype and ctype not in settings.allow_content_types:
+        _emit_signature_receipt(request, False, "type_blocked", None)
+        return Response(status_code=415, media_type="application/json", content=json.dumps({"detail": "type_blocked"}))
+    sig_input_header = request.headers.get("signature-input")
+    sig_header = request.headers.get("signature")
+    if not sig_input_header or not sig_header:
+        _emit_signature_receipt(request, False, "sig_missing", None)
+        return Response(status_code=401, media_type="application/json", content=json.dumps({"detail": "sig_missing"}))
+    parsed = _parse_signature_input(sig_input_header)
+    if not parsed:
+        _emit_signature_receipt(request, False, "sig_invalid", None)
+        return Response(status_code=400, media_type="application/json", content=json.dumps({"detail": "sig_invalid"}))
+    label, covered, params = parsed
+    required = {"@method", "@path", "@authority"}
+    has_body = body_len > 0
+    if has_body:
+        required.add("content-digest")
+    if not required.issubset(set(covered)):
+        _emit_signature_receipt(request, False, "sig_invalid", covered)
+        return Response(status_code=400, media_type="application/json", content=json.dumps({"detail": "sig_invalid"}))
+    if has_body:
+        cd_header = request.headers.get("content-digest")
+        if not cd_header:
+            _emit_signature_receipt(request, False, "digest_missing", covered)
+            return Response(status_code=400, media_type="application/json", content=json.dumps({"detail": "digest_missing"}))
+        # Accept either sha-256=<b64> or sha-256=:<b64>:
+        digest_b64 = None
+        try:
+            if ":" in cd_header and cd_header.count(":") >= 2 and cd_header.endswith(":"):
+                # sha-256=:<b64>:
+                algo, rest = cd_header.split("=:", 1)
+                digest_b64 = rest[:-1]
+            else:
+                algo, digest_b64 = cd_header.split("=", 1)
+            if algo.lower() != "sha-256":
+                raise ValueError("bad_alg")
+        except Exception:
+            _emit_signature_receipt(request, False, "digest_mismatch", covered)
+            return Response(status_code=400, media_type="application/json", content=json.dumps({"detail": "digest_mismatch"}))
+        calc = base64.b64encode(hashlib.sha256(body).digest()).decode()
+        if digest_b64 != calc:
+            _emit_signature_receipt(request, False, "digest_mismatch", covered)
+            return Response(status_code=400, media_type="application/json", content=json.dumps({"detail": "digest_mismatch"}))
+    # Extract key + signature from Signature header: sig1=:b64sig:
+    sig_map = {}
+    try:
+        for seg in sig_header.split(","):
+            if "=" in seg:
+                k, v = seg.split("=", 1)
+                sig_map[k.strip()] = v.strip()
+    except Exception:
+        _emit_signature_receipt(request, False, "sig_invalid", covered)
+        return Response(status_code=400, media_type="application/json", content=json.dumps({"detail": "sig_invalid"}))
+    sig_field = sig_map.get(label)
+    if not sig_field or not sig_field.startswith(":") or not sig_field.endswith(":"):
+        _emit_signature_receipt(request, False, "sig_invalid", covered)
+        return Response(status_code=400, media_type="application/json", content=json.dumps({"detail": "sig_invalid"}))
+    key_b64 = params.get("keyid") or params.get("keyId")
+    alg = (params.get("alg") or "ed25519").lower()
+    if alg != "ed25519" or not key_b64:
+        _emit_signature_receipt(request, False, "sig_invalid", covered)
+        return Response(status_code=400, media_type="application/json", content=json.dumps({"detail": "sig_invalid"}))
+    created_ts = int(params.get("created", "0") or 0)
+    now = int(time.time())
+    if created_ts == 0 or now - created_ts > settings.pch_max_age_seconds or created_ts > now + settings.pch_future_skew_seconds:
+        _emit_signature_receipt(request, False, "sig_invalid", covered)
+        return Response(status_code=400, media_type="application/json", content=json.dumps({"detail": "sig_invalid"}))
+    sig_b64 = sig_field.strip(":")
+    # Build base and verify
+    base = _build_rfc9421_base(request, covered, request.headers.get("content-digest"))
+    try:
+        from nacl.signing import VerifyKey
+        vk = VerifyKey(base64.b64decode(key_b64))
+        vk.verify(base, base64.b64decode(sig_b64))
+    except Exception:
+        _emit_signature_receipt(request, False, "sig_invalid", covered)
+        return Response(status_code=400, media_type="application/json", content=json.dumps({"detail": "sig_invalid"}))
+    # Re-inject body for downstream
+    async def receive_gen():
+        yield {"type": "http.request", "body": body, "more_body": False}
+    request._receive = receive_gen().__anext__  # type: ignore[attr-defined]
+    response = await call_next(request)
+    _emit_signature_receipt(request, response.status_code < 400, None if response.status_code < 400 else "sig_invalid", covered)
+    return response
