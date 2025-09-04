@@ -3,10 +3,23 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import json
+import os
+import subprocess
+import threading
 import time
-from typing import Any
+from pathlib import Path
+from typing import Any, Optional
 
 import httpx
+
+CBOM_OUTPUT_DIR = Path(os.getenv("CBOM_OUTPUT_DIR", "/var/lib/signet/cbom"))
+CBOM_INTERVAL_SECONDS = int(os.getenv("CBOM_INTERVAL_SECONDS", "900"))  # default 15m
+TLS_SNAPSHOT_PATH = Path(os.getenv("TLS_SNAPSHOT_PATH", "/var/run/proxy_tls.json"))
+
+# State for change-detection gating (avoid reposting identical CBOMs)
+_last_cbom_emit: float = 0.0
+_last_cbom_digest: Optional[str] = None
 
 
 def sha256_b64(b: bytes) -> str:
@@ -87,3 +100,125 @@ def from_handshake(api_url: str, *, policy_version: str, policy_hash_b64: str,
         allow=allow,
         reason=reason,
     )
+
+
+def write_tls_snapshot(enabled_ciphers: list[str], enabled_groups: list[str]):
+    TLS_SNAPSHOT_PATH.parent.mkdir(parents=True, exist_ok=True)
+    snapshot = {
+        "enabled_ciphers": enabled_ciphers,
+        "enabled_groups": enabled_groups,
+        "ts": int(time.time()),
+    }
+    TLS_SNAPSHOT_PATH.write_text(json.dumps(snapshot, indent=2))
+    return snapshot
+
+
+def _run_cbom_cycle(api_url: str):  # pragma: no cover - integration path
+    global _last_cbom_emit, _last_cbom_digest
+    CBOM_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    try:
+        proc = subprocess.run(["cbom-agent", "collect"], capture_output=True, text=True, timeout=20)
+        if proc.returncode != 0 or not proc.stdout.strip():
+            return
+        # Parse and canonicalize for digest
+        doc = json.loads(proc.stdout)
+        canonical = json.dumps(doc, sort_keys=True, separators=(",", ":")).encode()
+        digest = base64.b64encode(hashlib.sha256(canonical).digest()).decode()
+        if digest == _last_cbom_digest:
+            return  # unchanged -> skip write/post
+        ts = int(time.time())
+        out_path = CBOM_OUTPUT_DIR / f"cbom.{ts}.json"
+        out_path.write_text(proc.stdout)
+        try:
+            httpx.post(f"{api_url}/cbom/ingest", json=doc, timeout=10)
+            _last_cbom_emit = time.time()
+            _last_cbom_digest = digest
+        except Exception:  # noqa: S112
+            pass
+    except Exception:  # noqa: S112
+        pass
+
+
+def start_cbom_scheduler(api_url: str):  # pragma: no cover
+    def loop():
+        while True:
+            _run_cbom_cycle(api_url)
+            time.sleep(CBOM_INTERVAL_SECONDS)
+    t = threading.Thread(target=loop, name="cbom-agent-loop", daemon=True)
+    t.start()
+    return t
+
+
+__all__ = [
+    "emit_enforcement_event",
+    "from_handshake",
+    "write_tls_snapshot",
+    "start_cbom_scheduler",
+    "proxy_config_fingerprint",
+]
+
+
+def proxy_config_fingerprint(
+    nginx_conf_path: str = "/etc/nginx/nginx.conf",
+    snapshot_path: str | None = None,
+) -> dict[str, Any]:  # pragma: no cover - logic tested separately
+    """Compute a composite fingerprint of runtime TLS proxy configuration.
+
+    Steps:
+      1. Load TLS snapshot JSON (enabled ciphers/groups) written by proxy.
+      2. Extract canonical server { ... } block from nginx.conf (first occurrence).
+      3. Canonicalize both (sorted JSON keys for snapshot; trimmed lines for server block).
+      4. Produce individual hashes and a combined hash.
+
+    Returns dict with snapshot_hash_b64, server_block_hash_b64, fingerprint_b64.
+    On any failure, missing elements are omitted but function still returns structure.
+    """
+    snap_path = Path(snapshot_path) if snapshot_path else TLS_SNAPSHOT_PATH
+    snapshot_obj: Any = {}
+    try:
+        if snap_path.exists():
+            snapshot_obj = json.loads(snap_path.read_text())
+    except Exception:  # noqa: S112
+        snapshot_obj = {}
+    # Canonical snapshot serialization
+    try:
+        snapshot_canon = json.dumps(snapshot_obj, sort_keys=True, separators=(",", ":")).encode()
+    except Exception:
+        snapshot_canon = b"{}"
+    snapshot_hash_b64 = sha256_b64(snapshot_canon)
+
+    server_block_text = ""
+    try:
+        if Path(nginx_conf_path).exists():
+            lines = Path(nginx_conf_path).read_text().splitlines()
+            capturing = False
+            brace_depth = 0
+            collected: list[str] = []
+            for line in lines:
+                stripped = line.strip()
+                if not capturing and stripped.startswith("server") and "{" in stripped:
+                    capturing = True
+                    brace_depth = stripped.count("{") - stripped.count("}")
+                    collected.append(stripped)
+                    continue
+                if capturing:
+                    brace_depth += stripped.count("{") - stripped.count("}")
+                    collected.append(stripped)
+                    if brace_depth <= 0:
+                        break
+            # Filter comments and blank lines
+            filtered = [l for l in collected if l and not l.startswith("#")] if collected else []
+            server_block_text = "\n".join(filtered).strip()
+    except Exception:  # noqa: S112
+        server_block_text = ""
+    server_block_hash_b64 = sha256_b64(server_block_text.encode()) if server_block_text else sha256_b64(b"")
+
+    combined = snapshot_hash_b64.encode() + b"." + server_block_hash_b64.encode()
+    fingerprint_b64 = sha256_b64(combined)
+    return {
+        "snapshot_path": str(snap_path),
+        "nginx_conf_path": nginx_conf_path,
+        "snapshot_hash_b64": snapshot_hash_b64,
+        "server_block_hash_b64": server_block_hash_b64,
+        "fingerprint_b64": fingerprint_b64,
+    }

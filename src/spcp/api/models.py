@@ -1,7 +1,7 @@
 
 from __future__ import annotations
 
-from typing import Any, Literal
+from typing import Any, Literal, Optional
 
 from pydantic import BaseModel, Field
 
@@ -29,6 +29,32 @@ class PQCEnforcementReceipt(BaseModel):
     negotiated: PQCNegotiated
     decision: EnforcementDecision
     prev_receipt_hash_b64: str | None = None
+    # Optional post-handshake challenge (PCH) verification block
+    pch: Optional[dict] = None  # kept generic for backward compatibility; enriched schema below
+    # Extended metadata (route path and caller identifier like client IP)
+    route: str | None = None
+    caller_id: str | None = None
+
+
+class PCHEvidenceRef(BaseModel):
+    type: str
+    merkle_root_b64: str
+    cbom_hash_b64: str
+
+
+class PCHBlock(BaseModel):
+    present: bool
+    verified: bool
+    created: int | None = None  # epoch seconds from Authorization header
+    challenge: str | None = None  # base64 challenge/nonce value
+    key_id_b64: str | None = None
+    signature_b64: str | None = None
+    channel_binding: str | None = None
+    evidence_ref: PCHEvidenceRef | None = None
+    failure_reason: str | None = None
+    method: str | None = None
+    path: str | None = None
+    authority: str | None = None
 
 class CBOMEntry(BaseModel):
     provider: str
@@ -49,6 +75,7 @@ class PolicyDoc(BaseModel):
     deny_groups: list[str] = Field(default_factory=list)   # explicit denies win
     mode: Literal["classical", "hybrid", "pqc"] = "hybrid"
     description: str | None = None
+    require_pch: bool = False  # if true, PCH auth required for allow
 
 class PolicyChangeReceipt(BaseModel):
     kind: Literal["policy.change"] = "policy.change"
@@ -58,3 +85,27 @@ class PolicyChangeReceipt(BaseModel):
     to_version: str
     reason: str | None = None
     prev_receipt_hash_b64: str | None = None
+
+
+# --- Tuple-based policy (MVP) ---
+
+class AllowedTuples(BaseModel):
+    tls_version: list[str] = Field(default_factory=list)
+    kx_groups: list[str] = Field(default_factory=list)
+    sig_algs: list[str] = Field(default_factory=list)
+
+class TuplePolicy(BaseModel):
+    policy_id: str
+    allowed: AllowedTuples
+    deny_on_mismatch: bool = True
+
+    def evaluate(self, negotiated: PQCNegotiated) -> tuple[bool, str | None]:  # (allow, reason)
+        # Check each dimension; if list empty treat as wildcard.
+        if self.allowed.tls_version and negotiated.tls_version.replace("TLS","" ).replace("tls","" ) not in [v.replace("TLS","" ) for v in self.allowed.tls_version]:
+            return False, "tls_version_mismatch"
+        if self.allowed.kx_groups and negotiated.group_or_kem not in self.allowed.kx_groups:
+            return False, "kx_group_mismatch"
+        if self.allowed.sig_algs and negotiated.sig_alg not in self.allowed.sig_algs:
+            return False, "sig_alg_mismatch"
+        return True, None
+

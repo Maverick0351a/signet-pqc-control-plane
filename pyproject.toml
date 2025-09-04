@@ -26,6 +26,7 @@ dependencies = [
 
 [project.scripts]
 spcp_cli = "spcp.spcp_cli:main"
+cbom-agent = "cbom_agent.cli:main"
 
 [project.optional-dependencies]
 dev = [

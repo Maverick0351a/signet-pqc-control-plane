@@ -3,7 +3,7 @@ import time
 
 from fastapi.testclient import TestClient
 
-from spcp.api.main import app, DATA
+from spcp.api.main import DATA, app
 
 
 def setup_module():
