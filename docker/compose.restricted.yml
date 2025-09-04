@@ -1,0 +1,7 @@
+version: "3.9"
+services:
+  pqc_proxy:
+    volumes:
+      - ./docker/nginx/nginx.restricted.conf:/etc/nginx/nginx.conf:ro
+    environment:
+      - ALLOWED_GROUPS=X25519Kyber768

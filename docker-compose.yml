@@ -1,0 +1,27 @@
+version: "3.9"
+services:
+  app:
+    build: .
+    environment:
+      - SPCP_DATA_DIR=/data
+    ports:
+      - "8080:8000"
+    command: ["python","-m","uvicorn","spcp.api.main:app","--host","0.0.0.0","--port","8000"]
+    volumes:
+      - appdata:/data
+
+  pqc_proxy:
+    build: ./terminators/nginx-oqs
+    depends_on:
+      - app
+    ports:
+      - "443:443"
+    environment:
+      - ALLOWED_GROUPS=X25519Kyber768:X25519:P-256
+    volumes:
+      - ./certs:/etc/nginx/certs:ro
+      - pqclogs:/var/log/nginx
+
+volumes:
+  appdata:
+  pqclogs:

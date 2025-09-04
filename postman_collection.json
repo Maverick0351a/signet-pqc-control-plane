@@ -1,0 +1,40 @@
+{
+  "info": {
+    "name": "Signet PQC Control Plane",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "item": [
+    {
+      "name": "Get Policy",
+      "request": {"method": "GET", "url": {"raw": "{{baseUrl}}/policy", "host": ["{{baseUrl}}"], "path": ["policy"]}}
+    },
+    {
+      "name": "Update Policy",
+      "request": {"method": "PUT", "header": [{"key": "Content-Type", "value": "application/json"}], "body": {"mode": "raw", "raw": "{\n  \"version\": \"v1\",\n  \"allow_groups\": [\"p256_kyber768\"],\n  \"deny_groups\": [],\n  \"mode\": \"hybrid\",\n  \"description\": \"pilot\"\n}"}, "url": {"raw": "{{baseUrl}}/policy", "host": ["{{baseUrl}}"], "path": ["policy"]}}
+    },
+    {
+      "name": "Post Enforcement Event (Allow)",
+      "request": {"method": "POST", "header": [{"key": "Content-Type", "value": "application/json"}], "body": {"mode": "raw", "raw": "{\n  \"kind\": \"pqc.enforcement\",\n  \"ts_ms\": {{timestamp}},\n  \"policy_version\": \"v1\",\n  \"policy_hash_b64\": \"\",\n  \"negotiated\": {\n    \"tls_version\": \"TLS1.3\",\n    \"cipher\": \"TLS_AES_128_GCM_SHA256\",\n    \"group_or_kem\": \"p256_kyber768\",\n    \"sig_alg\": \"ed25519\"\n  },\n  \"decision\": {\"allow\": true}\n}"}, "url": {"raw": "{{baseUrl}}/events", "host": ["{{baseUrl}}"], "path": ["events"]}}
+    },
+    {
+      "name": "Latest Receipt",
+      "request": {"method": "GET", "url": {"raw": "{{baseUrl}}/receipts/latest", "host": ["{{baseUrl}}"], "path": ["receipts", "latest"]}}
+    },
+    {
+      "name": "Collect CBOM",
+      "request": {"method": "POST", "url": {"raw": "{{baseUrl}}/cbom/collect", "host": ["{{baseUrl}}"], "path": ["cbom", "collect"]}}
+    },
+    {
+      "name": "Latest CBOM",
+      "request": {"method": "GET", "url": {"raw": "{{baseUrl}}/cbom/latest", "host": ["{{baseUrl}}"], "path": ["cbom", "latest"]}}
+    },
+    {
+      "name": "Compliance Pack (ZIP)",
+      "request": {"method": "POST", "url": {"raw": "{{baseUrl}}/compliance/pack", "host": ["{{baseUrl}}"], "path": ["compliance", "pack"]}}
+    }
+  ],
+  "variable": [
+    {"key": "baseUrl", "value": "http://localhost:8000"},
+    {"key": "timestamp", "value": "{{$timestamp}}"}
+  ]
+}

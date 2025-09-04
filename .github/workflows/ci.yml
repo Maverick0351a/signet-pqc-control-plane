@@ -11,6 +11,7 @@ permissions:
 jobs:
   test:
     runs-on: ubuntu-latest
+    # No write permissions required for standard CI
     permissions:
       contents: read
     steps:
@@ -24,12 +25,21 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -e ".[dev]"
+      - name: Ruff auto-fix (imports & simple style)
+        run: ruff check . --fix --exit-zero
       - name: Ruff (lint)
         run: ruff check .
       - name: Mypy (type check)
         run: mypy src
       - name: Pytest
         run: pytest
+      - name: Upload coverage to Codecov
+        if: success()
+        uses: codecov/codecov-action@b9fd7d16f6d7d1b5d2bec1a2887e65ceed900238 # v4.6.0 pinned
+        with:
+          files: coverage.xml
+          fail_ci_if_error: true
+          verbose: false
       - name: Show coverage summary
         if: always()
         run: |

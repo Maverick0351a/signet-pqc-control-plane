@@ -1,29 +1,40 @@
 
 from __future__ import annotations
-import json, base64, hashlib, time
-from pathlib import Path
-from typing import Optional, Tuple
-from ..settings import settings
+
+import json
+import logging
+import time
+
+from ..api.models import PolicyChangeReceipt, PolicyDoc
 from ..receipts.sign import sign_receipt_ed25519
-from ..receipts.jcs import jcs_canonical
-from ..api.models import PolicyDoc, PolicyChangeReceipt
+from ..settings import settings
 
 POLICY_FILE = settings.spcp_data_dir / "policy.json"
 RECEIPTS_DIR = settings.spcp_data_dir / "receipts"
 RECEIPTS_DIR.mkdir(parents=True, exist_ok=True)
 
-def _read_prev_hash() -> Optional[str]:
-    # Read latest receipt to get its payload hash
+def _read_prev_hash() -> str | None:
+    """Return the payload hash of the newest valid receipt, skipping malformed files."""
     files = sorted(RECEIPTS_DIR.glob("*.json"))
-    if not files:
-        return None
-    latest = files[-1]
-    obj = json.loads(latest.read_text())
-    return obj.get("payload_hash_b64")
+    for p in reversed(files):  # newest first
+        try:
+            obj = json.loads(p.read_text())
+        except Exception as e:  # noqa: S112
+            logging.exception("Failed to parse receipt file %s while finding prev hash: %s", p, e)
+            continue
+        if isinstance(obj, dict) and "payload_hash_b64" in obj:
+            return obj.get("payload_hash_b64")
+    return None
 
 def load_policy() -> PolicyDoc:
     if not POLICY_FILE.exists():
-        doc = PolicyDoc(version="v0", allow_groups=[], deny_groups=[], mode="hybrid", description="default")
+        doc = PolicyDoc(
+            version="v0",
+            allow_groups=[],
+            deny_groups=[],
+            mode="hybrid",
+            description="default",
+        )
         POLICY_FILE.write_text(doc.model_dump_json(indent=2))
         return doc
     return PolicyDoc.model_validate_json(POLICY_FILE.read_text())

@@ -1,0 +1,21 @@
+openssl_conf = openssl_init
+
+[openssl_init]
+providers = provider_sect
+ssl_conf = ssl_module
+
+[provider_sect]
+default = default_sect
+oqsprovider = oqsprovider_sect
+
+[oqsprovider_sect]
+activate = 1
+
+[ssl_module]
+system_default = crypto_policy
+
+[crypto_policy]
+MinProtocol = TLSv1.3
+MaxProtocol = TLSv1.3
+# Cipher suites are standard TLS 1.3; the KEM/hybrid is controlled by TLS 1.3 Groups
+# (set via nginx ssl_conf_command per server).

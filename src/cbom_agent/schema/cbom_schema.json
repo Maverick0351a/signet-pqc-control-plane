@@ -1,0 +1,26 @@
+{
+  "$schema": "http://json-schema.org/draft-2020-12/schema#",
+  "$id": "https://example.com/signet/cdx-cbom.schema.json",
+  "title": "CycloneDX CBOM Profile (draft simplified)",
+  "type": "object",
+  "required": ["bomFormat", "specVersion", "serialNumber", "version", "metadata", "components"],
+  "properties": {
+    "bomFormat": {"const": "CycloneDX"},
+    "specVersion": {"type": "string"},
+    "profile": {"type": "string", "const": "cdx:cbom:1.0-draft"},
+    "serialNumber": {"type": "string", "pattern": "^urn:uuid:[0-9a-fA-F-]+$"},
+    "version": {"type": "integer", "minimum": 1},
+    "metadata": {
+      "type": "object",
+      "required": ["timestamp", "tools"],
+      "properties": {
+        "timestamp": {"type": "string"},
+        "tools": {"type": "array", "items": {"type": "object"}},
+        "properties": {"type": "array", "items": {"type": "object"}}
+      }
+    },
+    "components": {"type": "array", "items": {"type": "object"}},
+    "services": {"type": "array", "items": {"type": "object"}},
+    "signatures": {"type": "array", "items": {"type": "object"}}
+  }
+}

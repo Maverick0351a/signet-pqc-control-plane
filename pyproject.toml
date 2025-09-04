@@ -24,6 +24,10 @@ dependencies = [
   "httpx>=0.27.0",
 ]
 
+[project.scripts]
+spcp_cli = "spcp.spcp_cli:main"
+cbom-agent = "cbom_agent.cli:main"
+
 [project.optional-dependencies]
 dev = [
   "pytest>=8.2.0",
