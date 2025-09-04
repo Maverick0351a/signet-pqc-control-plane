@@ -1,0 +1,8 @@
+[Scanner]
+IgnoreVulns = []
+ExitOnError = true
+
+[[Ignore]]
+# Example structure for ignoring a specific advisory (commented out)
+# ID = "GHSA-xxxx-xxxx-xxxx"
+# Reason = "False positive: not reachable code path"
