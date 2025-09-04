@@ -1,10 +1,9 @@
-import json
 import shutil
 import time
 
 from fastapi.testclient import TestClient
 
-from spcp.api.main import app, DATA, RECEIPTS
+from spcp.api.main import app, DATA
 from spcp.settings import settings
 
 
@@ -29,7 +28,7 @@ def _set_policy(client, allow: list[str]):
 
 def test_soft_policy_denies_and_rate_limits(monkeypatch):
     c = TestClient(app)
-    policy = _set_policy(c, ["kyber768"])
+    _set_policy(c, ["kyber768"])
 
     # Do not delete existing receipts; we only count new enforcement receipts later.
 
@@ -43,7 +42,9 @@ def test_soft_policy_denies_and_rate_limits(monkeypatch):
         assert r.status_code == 403
         body = r.json()
         assert body["reason"] == "missing_group"
-        assert body.get("receipt_emitted") is True, f"expected emission on iteration {i}, body={body}"
+        assert body.get("receipt_emitted") is True, (
+            f"expected emission on iteration {i}, body={body}"
+        )
         emitted += 1
 
     # 4th within window -> still 403 but no new receipt emitted
@@ -57,7 +58,7 @@ def test_soft_policy_denies_and_rate_limits(monkeypatch):
 
 def test_soft_policy_allows_when_group_present():
     c = TestClient(app)
-    policy = _set_policy(c, ["grpA"])
+    _set_policy(c, ["grpA"])
     # Provide header so it is allowed
     r = c.get("/echo", headers={"x-tls-group": "grpA", "x-tls-alpn": "h2"})
     # Allowed path returns underlying handler output

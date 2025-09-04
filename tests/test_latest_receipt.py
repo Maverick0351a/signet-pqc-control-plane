@@ -1,13 +1,13 @@
 import json
+import os
 import shutil
+import tempfile
 import time
 from pathlib import Path
-import os
-import tempfile
 
 from fastapi.testclient import TestClient
 
-from spcp.api.main import app, DATA, RECEIPTS
+from spcp.api.main import app, DATA
 
 
 def setup_module():
@@ -63,7 +63,7 @@ def test_latest_receipt_picks_newest_and_ignores_malformed():
     time.sleep(0.01)
 
     # Newest valid receipt
-    newest = write_receipt("r3", "pqc.enforcement", {"a": 3})
+    write_receipt("r3", "pqc.enforcement", {"a": 3})
 
     r = c.get("/receipts/latest")
     assert r.status_code == 200, r.text

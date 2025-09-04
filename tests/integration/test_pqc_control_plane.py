@@ -1,6 +1,6 @@
 import os
-import time
 import subprocess
+import time
 from pathlib import Path
 
 import pytest
@@ -47,7 +47,16 @@ def test_allow_then_deny_flow():
 
         # Phase B: restricted proxy
         subprocess.check_call(["docker","compose","down"], cwd=REPO_ROOT)
-        subprocess.check_call(["docker","compose","-f","docker-compose.yml","-f","docker/compose.restricted.yml","up","-d"], cwd=REPO_ROOT)
+        subprocess.check_call([
+            "docker",
+            "compose",
+            "-f",
+            "docker-compose.yml",
+            "-f",
+            "docker/compose.restricted.yml",
+            "up",
+            "-d",
+        ], cwd=REPO_ROOT)
         time.sleep(4)
         # Trigger traffic (ignore cert verify for local self-signed)
         try:

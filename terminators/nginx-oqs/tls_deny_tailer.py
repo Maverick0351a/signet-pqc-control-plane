@@ -1,18 +1,23 @@
 import argparse
+from pathlib import Path
 import os
 import re
 import time
+
 import requests
 
 # Patterns to capture various failure modes and metadata.
-# Example NGINX error lines (OpenSSL/OQS variants may differ slightly):
-# 2024/09/03 10:51:22 [info] 6#6: *3 SSL_do_handshake() failed (SSL: error:0A000126:SSL routines::unexpected eof while reading) while SSL handshaking, client: 10.1.2.3:58432, server: example.test
-# 2024/09/03 10:51:25 [info] 6#6: *4 SSL_do_handshake() failed (SSL: error:0A00018E:SSL routines::no shared groups) while SSL handshaking, client: 10.1.2.3:58440, server: example.test
-# 2024/09/03 10:51:28 [info] 6#6: *5 SSL_do_handshake() failed (SSL: error:0A000152:SSL routines::unsupported group) while SSL handshaking, client: 10.1.2.3:58441, server: example.test
+# Example truncated NGINX error lines (OpenSSL/OQS variants vary):
+#   ... SSL_do_handshake() failed (SSL: error:...:no shared groups) while SSL handshaking,
+#       client: 10.1.2.3:58440, server: example.test
+#   ... SSL_do_handshake() failed (SSL: error:...:unsupported group) while SSL handshaking,
+#       client: 10.1.2.3:58441, server: example.test
 
-BASE_PATTERN = re.compile(r'.*SSL_do_handshake\(\) failed.*?client:\s*(?P<ipport>[^,]+),.*?server:\s*(?P<sni>\S+).*')
-NO_SHARED_GROUPS_RE = re.compile(r'no shared groups', re.IGNORECASE)
-UNSUPPORTED_GROUP_RE = re.compile(r'unsupported group', re.IGNORECASE)
+BASE_PATTERN = re.compile(
+    r".*SSL_do_handshake\(\) failed.*?client:\s*(?P<ipport>[^,]+),.*?server:\s*(?P<sni>\S+).*"
+)
+NO_SHARED_GROUPS_RE = re.compile(r"no shared groups", re.IGNORECASE)
+UNSUPPORTED_GROUP_RE = re.compile(r"unsupported group", re.IGNORECASE)
 
 def classify_reason(line: str) -> str:
     if NO_SHARED_GROUPS_RE.search(line):
@@ -22,7 +27,9 @@ def classify_reason(line: str) -> str:
     return "handshake_failure"
 
 def main():
-    ap = argparse.ArgumentParser(description="Tail NGINX error log for TLS handshake failures and emit deny events")
+    ap = argparse.ArgumentParser(
+        description="Tail NGINX error log for TLS handshake failures and emit deny events"
+    )
     ap.add_argument("--error-log", required=True)
     ap.add_argument("--events-url", required=True, help="Control plane /events endpoint (http://host:port/events)")
     ap.add_argument("--policy-id", default="default-pqc-policy")
@@ -33,7 +40,7 @@ def main():
     args = ap.parse_args()
 
     # naive tail -f
-    with open(args.error_log, "r", encoding="utf-8", errors="ignore") as f:
+    with Path(args.error_log).open(encoding="utf-8", errors="ignore") as f:  # noqa: PTH123
         f.seek(0, 2)
         while True:
             line = f.readline()
@@ -72,8 +79,7 @@ def main():
                 }
                 try:
                     requests.post(args.events_url, json=payload, timeout=2.0)
-                except Exception:
-                    # swallow to keep tailer alive
+                except Exception:  # noqa: S110 - best effort emitter
                     pass
 
 if __name__ == "__main__":  # pragma: no cover

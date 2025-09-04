@@ -4,6 +4,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+import os
 import time
 from pathlib import Path
 
@@ -15,7 +16,6 @@ from ..receipts.merkle import build_sth
 from ..receipts.sign import sign_receipt_ed25519
 from ..settings import settings
 from .models import PolicyDoc, PQCCBOMReceipt, PQCEnforcementReceipt
-import os
 
 app = FastAPI(title="Signet PQC Control Plane (MVP)")
 
@@ -86,7 +86,7 @@ def _read_prev_hash():
     for p in reversed(files):  # iterate newest first
         try:
             obj = json.loads(p.read_text())
-        except Exception:
+        except Exception:  # noqa: S112 - tolerate malformed
             continue
         if isinstance(obj, dict) and "payload_hash_b64" in obj:
             return obj.get("payload_hash_b64")
@@ -105,7 +105,7 @@ def _refresh_sth():
     for f in files:
         try:
             obj = json.loads(f.read_text())
-        except Exception:
+        except Exception:  # noqa: S112
             continue
         if not isinstance(obj, dict):
             continue
@@ -113,7 +113,7 @@ def _refresh_sth():
         core = {k: v for k, v in obj.items() if k not in excluded}
         try:
             payload = json.dumps(core, sort_keys=True, separators=(",", ":")).encode()
-        except Exception:
+        except Exception:  # noqa: S112
             continue
         leaves.append(hashlib.sha256(payload).digest())
     leaves_b64 = [base64.b64encode(x).decode() for x in leaves]
@@ -167,7 +167,7 @@ _deny_window: list[float] = []  # timestamps of recently emitted soft deny recei
 async def soft_policy_enforcer(request: Request, call_next):  # pragma: no cover (tested indirectly)
     path = request.url.path
     # Skip control endpoints
-    if path.startswith("/events") or path.startswith("/policy") or path.startswith("/health") or path.startswith("/receipts"):
+    if path.startswith(("/events", "/policy", "/health", "/receipts")):
         return await call_next(request)
     # If no other application routes exist, this will rarely trigger; placeholder for integration.
     negotiated = extract_handshake_tuple(request.headers)
@@ -261,10 +261,10 @@ def post_event(request: Request, body: dict = Body(...)):  # noqa: B008 FastAPI 
     from datetime import datetime, timezone
     ts_ms = signed.get("ts_ms")
     if ts_ms is not None:
-        dt = datetime.fromtimestamp(ts_ms/1000, tz=timezone.utc)
-        rfc3339 = dt.isoformat().replace('+00:00','Z')
+        dt = datetime.fromtimestamp(ts_ms / 1000, tz=timezone.utc)
+        rfc3339 = dt.isoformat().replace("+00:00", "Z")
     else:
-        rfc3339 = datetime.now(timezone.utc).isoformat().replace('+00:00','Z')
+        rfc3339 = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
     decision_obj = signed.get("decision", {}) if isinstance(signed.get("decision"), dict) else {}
     decision_str = "allow" if decision_obj.get("allow") else "deny"
     reason_val = decision_obj.get("reason")
