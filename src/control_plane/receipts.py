@@ -3,19 +3,16 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+import os
+import threading
 import time
 from pathlib import Path
 from typing import Any
 
-from spcp.receipts.sign import sign_receipt_ed25519
+from spcp.api.main import DATA, _load_keys, _read_prev_hash, _store_signed_receipt
 from spcp.receipts.jcs import jcs_canonical
-from spcp.api.main import (
-    _read_prev_hash,  # noqa: WPS450 (reuse internal helpers)
-    _store_signed_receipt,
-    _refresh_sth,
-    _load_keys,
-    DATA,
-)
+from spcp.receipts.merkle import build_sth
+from spcp.receipts.sign import sign_receipt_ed25519
 
 
 def _sha256_b64(data: bytes) -> str:
@@ -48,7 +45,6 @@ def write_cbom_receipt(
     signed = sign_receipt_ed25519(rec, sk)
     hash_prefix = signed["payload_hash_b64"][:8].replace("/", "_").replace("+", "-")
     _store_signed_receipt(f"pqc_cbom_{hash_prefix}", signed)
-    _refresh_sth()
     return signed
 
 
@@ -71,7 +67,6 @@ def write_drift_receipt(
     signed = sign_receipt_ed25519(rec, sk)
     hash_prefix = signed["payload_hash_b64"][:8].replace("/", "_").replace("+", "-")
     _store_signed_receipt(f"pqc_drift_{hash_prefix}", signed)
-    _refresh_sth()
     return signed
 
 
@@ -96,8 +91,151 @@ def write_policy_change_receipt(kind: str, previous: str | None, new: str) -> di
     signed = sign_receipt_ed25519(rec, sk)
     hash_prefix = signed["payload_hash_b64"][:8].replace("/", "_").replace("+", "-")
     _store_signed_receipt(f"policy_change_{hash_prefix}", signed)
-    _refresh_sth()
     return signed
+
+
+# ---------------------------------------------------------------------------
+# Enforcement Receipts + Batched Merkle STH Generation (control-plane flavor)
+# ---------------------------------------------------------------------------
+
+PROOFS_DIR = DATA / "proofs"
+STH_DIR = DATA / "sth"
+for _d in (PROOFS_DIR, STH_DIR):
+    _d.mkdir(parents=True, exist_ok=True)
+
+_batch_lock = threading.Lock()
+_batch_leaf_hashes: list[bytes] = []  # raw sha256 payload hashes
+_batch_receipt_paths: list[Path] = []
+_last_sth_root: str | None = None
+
+_STH_INTERVAL_SECONDS = int(os.getenv("PQC_STH_INTERVAL_SECONDS", "60"))
+
+
+def write_enforcement_receipt(
+    decision: bool,
+    reason: str | None,
+    caller_id: str | None,
+    route: str | None,
+    pch_present: bool,
+    pch_verified: bool,
+    binding_type: str | None,
+    evidence_ref: dict[str, Any] | None,
+    failure_reason: str | None,
+    negotiated: dict[str, Any] | None = None,
+    policy_version: str | None = None,
+    policy_hash_b64: str | None = None,
+) -> dict:
+    """Create and persist a pqc.enforcement receipt and enqueue leaf for next STH.
+
+    Parameters mirror enforcement context. Only minimal negotiated tuple is stored
+    if provided. prev_receipt_hash_b64 forms a hash-linked chain referencing the
+    previous receipt's payload hash.
+    """
+    sk, _ = _load_keys()
+    rec: dict[str, Any] = {
+        "kind": "pqc.enforcement",
+        "ts_ms": int(time.time() * 1000),
+        "decision": {"allow": bool(decision), **({"reason": reason} if reason else {})},
+        "prev_receipt_hash_b64": _read_prev_hash(),
+        "caller_id": caller_id,
+        "route": route,
+    }
+    if policy_version:
+        rec["policy_version"] = policy_version
+    if policy_hash_b64:
+        rec["policy_hash_b64"] = policy_hash_b64
+    if negotiated:
+        rec["negotiated"] = negotiated
+    if pch_present:
+        rec["pch_present"] = True
+        rec["pch"] = {
+            "present": True,
+            "verified": pch_verified,
+            "channel_binding": binding_type,
+            "evidence_ref": evidence_ref,
+            "failure_reason": failure_reason,
+        }
+    signed = sign_receipt_ed25519(rec, sk)
+    hash_prefix = signed["payload_hash_b64"][:8].replace("/", "_").replace("+", "-")
+    path = _store_signed_receipt(f"pqc_enforcement_{hash_prefix}", signed)
+    # Enqueue for next STH batch
+    try:
+        raw_hash = base64.b64decode(signed["payload_hash_b64"])  # 32 bytes
+        with _batch_lock:
+            _batch_leaf_hashes.append(raw_hash)
+            _batch_receipt_paths.append(path)
+    except Exception:  # pragma: no cover - defensive
+        import logging as _log
+        _log.debug("enqueue enforcement receipt failed", exc_info=True)
+    return signed
+
+
+def _flush_sth_batch() -> None:
+    """Build Merkle tree for current batch and persist STH + inclusion proofs."""
+    global _batch_leaf_hashes, _batch_receipt_paths, _last_sth_root
+    with _batch_lock:
+        if not _batch_leaf_hashes:
+            return
+        leaf_hashes = _batch_leaf_hashes
+        paths = _batch_receipt_paths
+        _batch_leaf_hashes = []
+        _batch_receipt_paths = []
+    # Build STH
+    leaves_b64 = [base64.b64encode(h).decode() for h in leaf_hashes]
+    sth = build_sth(leaves_b64)
+    sth["kind"] = "pqc.sth"
+    # Sign STH (treat as receipt-like object)
+    sk, _ = _load_keys()
+    signed_sth = sign_receipt_ed25519(sth, sk)
+    root = signed_sth.get("root_sha256_b64") or sth.get("root_sha256_b64")
+    _last_sth_root = root
+    ts = signed_sth.get("timestamp") or int(time.time() * 1000)
+    STH_DIR.mkdir(parents=True, exist_ok=True)
+    sth_file = STH_DIR / f"sth_{ts}.json"
+    sth_file.write_text(json.dumps(signed_sth, indent=2))
+    # Inclusion proofs per leaf
+    from spcp.receipts.merkle import inclusion_proof as _inc
+    for idx, (leaf_raw, path) in enumerate(zip(leaf_hashes, paths, strict=False)):
+        try:
+            proof = _inc(idx, leaf_hashes)
+            proof_doc = {
+                "kind": "pqc.proof.inclusion",
+                "leaf_index": idx,
+                "leaf_hash_b64": base64.b64encode(leaf_raw).decode(),
+                "sth_root_b64": root,
+                "tree_size": len(leaf_hashes),
+                "proof": proof,
+                "receipt_file": path.name,
+            }
+            proof_file = PROOFS_DIR / f"proof_{path.stem}.json"
+            proof_file.write_text(json.dumps(proof_doc, indent=2))
+        except Exception:  # pragma: no cover
+            import logging as _log
+            _log.debug("failed writing inclusion proof", exc_info=True)
+            continue
+
+
+def _sth_loop() -> None:  # pragma: no cover - background
+    while True:
+        time.sleep(_STH_INTERVAL_SECONDS)
+        try:
+            _flush_sth_batch()
+        except Exception:  # pragma: no cover
+            import logging as _log
+            _log.debug("STH batch flush error", exc_info=True)
+            continue
+
+
+# Start background thread on module import
+_sth_thread = threading.Thread(target=_sth_loop, name="sth-batch-loop", daemon=True)
+_sth_thread.start()
+
+__all__ = [
+    "write_cbom_receipt",
+    "write_drift_receipt",
+    "write_policy_change_receipt",
+    "write_enforcement_receipt",
+]
 
 
 # Storage helpers for CBOM/baseline/documents
@@ -188,7 +326,7 @@ def compute_json_patch(a: Any, b: Any, path: str = "") -> list[dict[str, Any]]: 
         return ops
     if isinstance(a, list):
         # naive list diff: replace when different length or element mismatch
-        if len(a) != len(b) or any(x != y for x, y in zip(a, b)):
+        if len(a) != len(b) or any(x != y for x, y in zip(a, b, strict=False)):
             ops.append({"op": "replace", "path": path or "/", "value": b})
         return ops
     if a != b:
