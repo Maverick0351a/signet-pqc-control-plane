@@ -11,6 +11,7 @@ permissions:
 jobs:
   test:
     runs-on: ubuntu-latest
+    # No write permissions required for standard CI
     permissions:
       contents: read
     steps:
