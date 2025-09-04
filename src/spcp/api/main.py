@@ -6,7 +6,7 @@ import hashlib
 import json
 from pathlib import Path
 
-from fastapi import Body, FastAPI, HTTPException
+from fastapi import Body, FastAPI, HTTPException, Request
 
 from ..policy.circuit_breaker import CircuitBreaker
 from ..policy.store import load_policy, set_policy
@@ -97,12 +97,34 @@ def _refresh_sth():
     STH_FILE.write_text(json.dumps(sth, indent=2))
     return sth
 
+def extract_handshake_tuple(headers: dict) -> dict:
+    """Extract TLS handshake telemetry from proxy-provided headers.
+
+    Header names are case-insensitive; FastAPI provides a case-insensitive
+    mapping. Values may be None if the proxy did not supply them.
+    """
+    # Lower-case keys for uniform access
+    def h(name: str):
+        return headers.get(name)
+    return {
+        "tls_version": h("x-tls-protocol"),
+        "cipher": h("x-tls-cipher"),
+        "group_or_kem": h("x-tls-group"),
+        "sig_alg": "ed25519",  # placeholder; real extraction would require mTLS or custom tap
+        "sni": h("x-tls-sni"),
+        "peer_ip": None,  # could be added via X-Forwarded-For
+    }
+
+
 @app.post("/events")
-def post_event(body: dict = Body(...)):  # noqa: B008 FastAPI dependency pattern
+def post_event(request: Request, body: dict = Body(...)):  # noqa: B008 FastAPI dependency pattern
     sk, vk = _load_keys()
     kind = body.get("kind")
     # Validate & sign with server key (control plane as anchor)
     if kind == "pqc.enforcement":
+        # If client omitted negotiated section, attempt to build from headers
+        if "negotiated" not in body:
+            body["negotiated"] = extract_handshake_tuple(request.headers)
         rec = PQCEnforcementReceipt.model_validate(body).model_dump()
     elif kind == "pqc.cbom":
         rec = PQCCBOMReceipt.model_validate(body).model_dump()
