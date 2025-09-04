@@ -72,6 +72,7 @@ def _read_prev_hash():
 
 def _store_signed_receipt(name: str, signed: dict) -> Path:
     p = RECEIPTS / f"{name}.json"
+    RECEIPTS.mkdir(parents=True, exist_ok=True)
     p.write_text(json.dumps(signed, indent=2))
     return p
 
@@ -104,7 +105,9 @@ def post_event(body: dict = Body(...)):
 
     rec["prev_receipt_hash_b64"] = _read_prev_hash()
     signed = sign_receipt_ed25519(rec, sk)
-    _store_signed_receipt(f"{kind.replace('.','_')}_{signed['payload_hash_b64'][:8]}", signed)
+    # Sanitize hash fragment for filesystem (base64 can contain '/' '+')
+    hash_prefix = signed['payload_hash_b64'][:8].replace('/', '_').replace('+', '-')
+    _store_signed_receipt(f"{kind.replace('.','_')}_{hash_prefix}", signed)
     _refresh_sth()
 
     # Feed circuit breaker with outcome if enforcement
