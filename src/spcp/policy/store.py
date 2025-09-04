@@ -13,13 +13,16 @@ RECEIPTS_DIR = settings.spcp_data_dir / "receipts"
 RECEIPTS_DIR.mkdir(parents=True, exist_ok=True)
 
 def _read_prev_hash() -> str | None:
-    # Read latest receipt to get its payload hash
+    """Return the payload hash of the newest valid receipt, skipping malformed files."""
     files = sorted(RECEIPTS_DIR.glob("*.json"))
-    if not files:
-        return None
-    latest = files[-1]
-    obj = json.loads(latest.read_text())
-    return obj.get("payload_hash_b64")
+    for p in reversed(files):  # newest first
+        try:
+            obj = json.loads(p.read_text())
+        except Exception:
+            continue
+        if isinstance(obj, dict) and "payload_hash_b64" in obj:
+            return obj.get("payload_hash_b64")
+    return None
 
 def load_policy() -> PolicyDoc:
     if not POLICY_FILE.exists():

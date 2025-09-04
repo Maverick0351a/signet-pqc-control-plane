@@ -13,6 +13,9 @@ class PQCNegotiated(BaseModel):
     sig_alg: str
     sni: str | None = None
     peer_ip: str | None = None
+    alpn: str | None = None  # negotiated application protocol (e.g., h2, http/1.1)
+    client_cert_sha256: str | None = None  # future mTLS support (hex or b64 digest)
+    client_cert_sig_alg: str | None = None  # signature algorithm of client cert
 
 class EnforcementDecision(BaseModel):
     allow: bool

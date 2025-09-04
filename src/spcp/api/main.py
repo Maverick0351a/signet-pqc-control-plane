@@ -4,6 +4,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+import time
 from pathlib import Path
 
 from fastapi import Body, FastAPI, HTTPException, Request, Response
@@ -14,6 +15,7 @@ from ..receipts.merkle import build_sth
 from ..receipts.sign import sign_receipt_ed25519
 from ..settings import settings
 from .models import PolicyDoc, PQCCBOMReceipt, PQCEnforcementReceipt
+import os
 
 app = FastAPI(title="Signet PQC Control Plane (MVP)")
 
@@ -41,10 +43,13 @@ def _load_keys():
     previously generated transient key files. To keep the API resilient we
     recreate them here if missing instead of assuming one-shot startup logic.
     """
+    # If data directory or key dir was removed after import (tests), recreate.
+    KEY_DIR.mkdir(parents=True, exist_ok=True)
     if (not SK_FILE.exists()) or (not VK_FILE.exists()):
         from ..receipts.sign import gen_ed25519_keypair
-        KEY_DIR.mkdir(parents=True, exist_ok=True)
         sk_new, vk_new = gen_ed25519_keypair()
+        # Extra safety: ensure parent exists right before writing
+        SK_FILE.parent.mkdir(parents=True, exist_ok=True)
         SK_FILE.write_text(base64.b64encode(sk_new).decode())
         VK_FILE.write_text(base64.b64encode(vk_new).decode())
     sk = base64.b64decode(SK_FILE.read_text().strip())
@@ -54,6 +59,7 @@ def _load_keys():
 _cb = CircuitBreaker()
 
 @app.get("/health")
+@app.get("/healthz")  # alias for k8s style probes
 def health():
     return {"ok": True}
 
@@ -63,17 +69,28 @@ def get_policy():
 
 @app.put("/policy")
 def put_policy(doc: PolicyDoc):
+    # Recreate data directories if removed after import (test isolation)
+    for d in (RECEIPTS, PROOFS, KEY_DIR):
+        d.mkdir(parents=True, exist_ok=True)
     sk, _ = _load_keys()
     signed = set_policy(doc, sk)
     _refresh_sth()
     return signed
 
 def _read_prev_hash():
+    """Return the payload hash of the newest well-formed receipt.
+
+    Malformed / truncated JSON files are skipped to keep chain resilient.
+    """
     files = sorted(RECEIPTS.glob("*.json"))
-    if not files:
-        return None
-    obj = json.loads(files[-1].read_text())
-    return obj.get("payload_hash_b64")
+    for p in reversed(files):  # iterate newest first
+        try:
+            obj = json.loads(p.read_text())
+        except Exception:
+            continue
+        if isinstance(obj, dict) and "payload_hash_b64" in obj:
+            return obj.get("payload_hash_b64")
+    return None
 
 def _store_signed_receipt(name: str, signed: dict) -> Path:
     p = RECEIPTS / f"{name}.json"
@@ -82,15 +99,22 @@ def _store_signed_receipt(name: str, signed: dict) -> Path:
     return p
 
 def _refresh_sth():
-    """Recompute STH over all receipts in insertion order."""
+    """Recompute STH over all receipts, skipping malformed ones."""
     files = sorted(RECEIPTS.glob("*.json"))
-    leaves = []
+    leaves: list[bytes] = []
     for f in files:
-        obj = json.loads(f.read_text())
-        # leaf = sha256(payload) excluding signature fields
+        try:
+            obj = json.loads(f.read_text())
+        except Exception:
+            continue
+        if not isinstance(obj, dict):
+            continue
         excluded = ("payload_hash_b64", "receipt_sig_b64", "sig_alg")
         core = {k: v for k, v in obj.items() if k not in excluded}
-        payload = json.dumps(core, sort_keys=True, separators=(",", ":")).encode()
+        try:
+            payload = json.dumps(core, sort_keys=True, separators=(",", ":")).encode()
+        except Exception:
+            continue
         leaves.append(hashlib.sha256(payload).digest())
     leaves_b64 = [base64.b64encode(x).decode() for x in leaves]
     sth = build_sth(leaves_b64)
@@ -98,21 +122,34 @@ def _refresh_sth():
     return sth
 
 def extract_handshake_tuple(headers: dict) -> dict:
-    """Extract TLS handshake telemetry from proxy-provided headers.
+    """Extract negotiated TLS / PQC parameters from ingress headers.
 
-    Header names are case-insensitive; FastAPI provides a case-insensitive
-    mapping. Values may be None if the proxy did not supply them.
+    Expected (case-insensitive) headers per requirement:
+      - X-TLS-Protocol  -> tls_version
+      - X-TLS-Cipher    -> cipher
+      - X-TLS-Group     -> group_or_kem
+      - X-ALPN (or legacy X-TLS-ALPN) -> alpn
+      - X-TLS-SNI       -> sni
+
+    We also tolerate the earlier "X-TLS-ALPN" header for backwards compatibility.
     """
-    # Lower-case keys for uniform access
-    def h(name: str):
-        return headers.get(name)
+    def h(*names: str):  # return first present header value
+        for n in names:
+            v = headers.get(n)
+            if v is not None:
+                return v
+        return None
+
     return {
         "tls_version": h("x-tls-protocol"),
         "cipher": h("x-tls-cipher"),
         "group_or_kem": h("x-tls-group"),
-        "sig_alg": "ed25519",  # placeholder; real extraction would require mTLS or custom tap
+        "sig_alg": "ed25519",  # placeholder until real extraction
         "sni": h("x-tls-sni"),
-        "peer_ip": None,  # could be added via X-Forwarded-For
+        "peer_ip": None,
+        "alpn": h("x-alpn", "x-tls-alpn"),
+        "client_cert_sha256": None,
+        "client_cert_sig_alg": None,
     }
 
 
@@ -123,11 +160,14 @@ def _compute_policy_hash(doc: PolicyDoc) -> str:
     return base64.b64encode(hashlib.sha256(payload).digest()).decode()
 
 
+_deny_window: list[float] = []  # timestamps of recently emitted soft deny receipts
+
+
 @app.middleware("http")
-async def soft_policy_enforcer(request: Request, call_next):  # pragma: no cover (separate test may cover)
+async def soft_policy_enforcer(request: Request, call_next):  # pragma: no cover (tested indirectly)
     path = request.url.path
     # Skip control endpoints
-    if path.startswith("/events") or path.startswith("/policy") or path.startswith("/health"):
+    if path.startswith("/events") or path.startswith("/policy") or path.startswith("/health") or path.startswith("/receipts"):
         return await call_next(request)
     # If no other application routes exist, this will rarely trigger; placeholder for integration.
     negotiated = extract_handshake_tuple(request.headers)
@@ -142,27 +182,39 @@ async def soft_policy_enforcer(request: Request, call_next):  # pragma: no cover
         deny_reason = "not_in_allowlist"
 
     if deny_reason:
+        # Rate limit deny receipts to avoid spam
+        now = time.time()
+        window_seconds = settings.soft_policy_window_seconds()
+        limit = settings.soft_policy_deny_limit
+        # prune
+        while _deny_window and now - _deny_window[0] > window_seconds:
+            _deny_window.pop(0)
+        emit = len(_deny_window) < limit
+        if emit:
+            _deny_window.append(now)
         # Emit a deny enforcement receipt representing a soft validation failure
-        sk, _ = _load_keys()
-        rec = {
-            "kind": "pqc.enforcement",
-            "ts_ms": int(time.time() * 1000),
-            "policy_version": policy.version,
-            "policy_hash_b64": _compute_policy_hash(policy),
-            "negotiated": negotiated,
-            "decision": {"allow": False, "reason": deny_reason},
-            "prev_receipt_hash_b64": _read_prev_hash(),
-        }
-        signed = sign_receipt_ed25519(rec, sk)
-        hash_prefix = signed["payload_hash_b64"][:8].replace("/", "_").replace("+", "-")
-        _store_signed_receipt(f"pqc_enforcement_{hash_prefix}", signed)
-        _refresh_sth()
+        if emit:
+            sk, _ = _load_keys()
+            rec = {
+                "kind": "pqc.enforcement",
+                "ts_ms": int(time.time() * 1000),
+                "policy_version": policy.version,
+                "policy_hash_b64": _compute_policy_hash(policy),
+                "negotiated": negotiated,
+                "decision": {"allow": False, "reason": deny_reason},
+                "prev_receipt_hash_b64": _read_prev_hash(),
+            }
+            signed = sign_receipt_ed25519(rec, sk)
+            hash_prefix = signed["payload_hash_b64"][:8].replace("/", "_").replace("+", "-")
+            _store_signed_receipt(f"pqc_enforcement_{hash_prefix}", signed)
+            _refresh_sth()
         return Response(
             status_code=403,
             media_type="application/json",
             content=json.dumps({
                 "detail": "pqc policy violation",
                 "reason": deny_reason,
+                "receipt_emitted": emit,
             }),
         )
     return await call_next(request)
@@ -172,6 +224,10 @@ async def soft_policy_enforcer(request: Request, call_next):  # pragma: no cover
 def post_event(request: Request, body: dict = Body(...)):  # noqa: B008 FastAPI dependency pattern
     sk, vk = _load_keys()
     kind = body.get("kind")
+    # Allow new schema alias 'type'
+    if kind is None and body.get("type"):
+        kind = body["type"]
+        body["kind"] = kind
     # Validate & sign with server key (control plane as anchor)
     if kind == "pqc.enforcement":
         # If client omitted negotiated section, attempt to build from headers
@@ -197,6 +253,44 @@ def post_event(request: Request, body: dict = Body(...)):  # noqa: B008 FastAPI 
         if changed:
             _refresh_sth()
 
+    # Outward compatibility layer: include new field naming schema while retaining legacy fields.
+    # New outward keys required: type, time (RFC3339), policy_id, decision (string), reason,
+    # negotiated { protocol, kex_group, sigalg, cipher }, peer, prev_receipt_hash_b64,
+    # payload_hash_b64, signature_b64, signer_kid.
+    # Derive RFC3339 time from ts_ms if present.
+    from datetime import datetime, timezone
+    ts_ms = signed.get("ts_ms")
+    if ts_ms is not None:
+        dt = datetime.fromtimestamp(ts_ms/1000, tz=timezone.utc)
+        rfc3339 = dt.isoformat().replace('+00:00','Z')
+    else:
+        rfc3339 = datetime.now(timezone.utc).isoformat().replace('+00:00','Z')
+    decision_obj = signed.get("decision", {}) if isinstance(signed.get("decision"), dict) else {}
+    decision_str = "allow" if decision_obj.get("allow") else "deny"
+    reason_val = decision_obj.get("reason")
+    nego = signed.get("negotiated", {}) or {}
+    outward_negotiated = {
+        "protocol": nego.get("tls_version"),
+        "kex_group": nego.get("group_or_kem"),
+        "sigalg": nego.get("sig_alg"),
+        "cipher": nego.get("cipher"),
+    }
+    # signer_kid: stable hash of verify key
+    signer_kid = base64.b64encode(hashlib.sha256(vk).digest()).decode()[:16]
+    # Preserve raw negotiated under negotiated_raw; outward transformed becomes negotiated
+    if "negotiated" in signed:
+        signed.setdefault("negotiated_raw", signed.get("negotiated"))
+    signed.update({
+        "type": signed.get("kind"),
+        "time": rfc3339,
+        "policy_id": signed.get("policy_version"),
+        "decision": decision_str,
+        "reason": reason_val,
+        "negotiated_summary": outward_negotiated,
+        "peer": body.get("peer"),
+        "signature_b64": signed.get("receipt_sig_b64"),
+        "signer_kid": signer_kid,
+    })
     return signed
 
 
@@ -204,3 +298,30 @@ def post_event(request: Request, body: dict = Body(...)):  # noqa: B008 FastAPI 
 def echo():
     """Simple placeholder application route subject to soft policy enforcement."""
     return {"ok": True}
+
+
+@app.get("/receipts/latest")
+def get_latest_receipt():  # pragma: no cover (tested separately)
+    """Return most recent valid receipt JSON (by mtime) or 404.
+
+    Uses SIGNET_STORAGE_DIR env var if set, else current DATA path.
+    Valid receipts must parse as JSON object and contain 'kind' or 'type'.
+    Skips unreadable / malformed files.
+    """
+    base_dir_env = os.getenv("SIGNET_STORAGE_DIR")
+    base = Path(base_dir_env) if base_dir_env else DATA
+    receipts_dir = base / "receipts"
+    if not receipts_dir.exists():
+        raise HTTPException(404, "no receipts")
+    files = list(receipts_dir.glob("*.json"))
+    if not files:
+        raise HTTPException(404, "no receipts")
+    files.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+    for p in files:
+        try:
+            obj = json.loads(p.read_text())
+        except Exception:
+            continue
+        if isinstance(obj, dict) and ("kind" in obj or "type" in obj):
+            return obj
+    raise HTTPException(404, "no valid receipts found")

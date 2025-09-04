@@ -94,3 +94,30 @@ docker compose exec pqc_proxy openssl list -groups -provider oqsprovider
 
 Update `ALLOWED_GROUPS` env and matching `ssl_conf_command Options -Groups` in `nginx.conf` to
 experiment with different hybrid sets.
+
+## Receipt Schema (Outward View)
+
+Each stored receipt internally uses `kind`. API responses also project outward convenience fields:
+
+- `type`: alias of `kind`
+- `time`: RFC3339 derived from `ts_ms`
+- `policy_id`: alias of `policy_version`
+- `decision`: flattened string ("allow"/"deny") plus original object under `decision`
+- `negotiated_raw`: full original negotiated structure
+- `negotiated_summary`: condensed `{ protocol, kex_group, sigalg, cipher }`
+- `signature_b64`, `signer_kid`: signature and short key identifier
+- `prev_receipt_hash_b64`: hash link
+
+Malformed JSON files in the receipts directory are ignored for STH and `/receipts/latest`.
+
+Health endpoints: `/health` and `/healthz`.
+
+## Integration Test (Optional)
+
+A two-phase integration test exercises an allow event then a restricted proxy phase. Enable with `RUN_INT=1`:
+
+```powershell
+make int-test
+```
+
+Phase A starts the default compose and posts an allow `pqc.enforcement` receipt. Phase B restarts the proxy with `docker/compose.restricted.yml`, triggering a different receipt (e.g. soft policy deny) which the test detects via `/receipts/latest`.
