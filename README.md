@@ -64,3 +64,33 @@ Use the `spcp.receipts.pack` helpers (or wire into your CLI) to bundle receipts 
 ## License
 
 Apache-2.0
+
+## PQC TLS Sidecar (Experimental)
+
+An experimental NGINX + OpenSSL 3 + OQS provider TLS terminator lives in `terminators/nginx-oqs/`.
+It builds `liboqs` and `oqs-provider`, auto-loads the provider via `openssl.cnf`, and exposes a
+TLS 1.3 endpoint advertising hybrid/PQC groups configured by `ssl_conf_command`.
+
+Bring it up with Docker Compose:
+
+```bash
+mkdir -p certs
+openssl req -x509 -newkey rsa:2048 -nodes -days 365 \
+  -keyout certs/server.key -out certs/server.crt -subj "/CN=localhost"
+
+docker compose build pqc_proxy
+docker compose up
+```
+
+Then:
+* App API (plaintext) → http://localhost:8080
+* PQC TLS sidecar → https://localhost:443
+
+List available hybrid/PQC groups inside the sidecar:
+
+```bash
+docker compose exec pqc_proxy openssl list -groups -provider oqsprovider
+```
+
+Update `ALLOWED_GROUPS` env and matching `ssl_conf_command Options -Groups` in `nginx.conf` to
+experiment with different hybrid sets.
