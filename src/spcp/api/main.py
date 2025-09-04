@@ -4,6 +4,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+import logging
 import os
 import time
 from pathlib import Path
@@ -86,7 +87,8 @@ def _read_prev_hash():
     for p in reversed(files):  # iterate newest first
         try:
             obj = json.loads(p.read_text())
-        except Exception:  # noqa: S112 - tolerate malformed
+        except Exception as e:  # noqa: S112 - tolerate malformed but log
+            logging.exception("Failed to parse receipt file %s: %s", p, e)
             continue
         if isinstance(obj, dict) and "payload_hash_b64" in obj:
             return obj.get("payload_hash_b64")
@@ -105,7 +107,8 @@ def _refresh_sth():
     for f in files:
         try:
             obj = json.loads(f.read_text())
-        except Exception:  # noqa: S112
+        except Exception as e:  # noqa: S112
+            logging.exception("Failed to parse receipt file %s during STH refresh: %s", f, e)
             continue
         if not isinstance(obj, dict):
             continue
@@ -113,7 +116,8 @@ def _refresh_sth():
         core = {k: v for k, v in obj.items() if k not in excluded}
         try:
             payload = json.dumps(core, sort_keys=True, separators=(",", ":")).encode()
-        except Exception:  # noqa: S112
+        except Exception as e:  # noqa: S112
+            logging.exception("Failed to canonicalize receipt core from %s: %s", f, e)
             continue
         leaves.append(hashlib.sha256(payload).digest())
     leaves_b64 = [base64.b64encode(x).decode() for x in leaves]
@@ -320,7 +324,8 @@ def get_latest_receipt():  # pragma: no cover (tested separately)
     for p in files:
         try:
             obj = json.loads(p.read_text())
-        except Exception:
+        except Exception as e:  # noqa: S112
+            logging.exception("Failed to parse candidate latest receipt %s: %s", p, e)
             continue
         if isinstance(obj, dict) and ("kind" in obj or "type" in obj):
             return obj

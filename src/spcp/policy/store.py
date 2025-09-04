@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import time
 
 from ..api.models import PolicyChangeReceipt, PolicyDoc
@@ -18,7 +19,8 @@ def _read_prev_hash() -> str | None:
     for p in reversed(files):  # newest first
         try:
             obj = json.loads(p.read_text())
-        except Exception:
+        except Exception as e:  # noqa: S112
+            logging.exception("Failed to parse receipt file %s while finding prev hash: %s", p, e)
             continue
         if isinstance(obj, dict) and "payload_hash_b64" in obj:
             return obj.get("payload_hash_b64")
