@@ -15,7 +15,11 @@ This repo ships a tiny control plane (FastAPI) plus receipt libraries and tests.
   - `pqc.cbom`
   - `policy.change`
 
-> **Note:** Canonicalization uses a deterministic JSON encoding (sorted keys, minimal separators). For strict RFC 8785 JCS equivalence, swap in a proven JCS implementation later. The receipts are designed to avoid floats to keep canonicalization stable.
+> **Note (Canonicalization):** As of PR #2 the project implements RFC 8785 (JCS) canonicalization. Older receipts (produced prior to that change) were created with a simpler sorted-key JSON encoder. If you have persisted historical receipts, run:
+> `python scripts/receipt_audit.py` (from the repo root) to see whether stored `payload_hash_b64` values match the new JCS hash. If `migration_needed=true` you must preserve legacy verification by either:
+> 1. Recomputing and re-signing receipts with JCS (not usually desirable), or
+> 2. Keeping a fallback legacy verifier that uses the old sorted-key algorithm for pre-migration timestamps.
+> For a fresh deployment (no existing receipts) no action is required.
 
 ## Quick start
 
