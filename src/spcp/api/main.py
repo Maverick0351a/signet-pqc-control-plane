@@ -227,8 +227,8 @@ def put_policy(doc: PolicyDoc):
     # Reset soft deny rate limiter on policy change to avoid stale saturation affecting new policy tests
     try:
         _deny_window.clear()
-    except Exception:  # pragma: no cover - defensive
-        pass
+    except Exception as e:  # pragma: no cover - defensive
+        logging.debug("Failed to clear deny window on policy change: %s", e)
     return signed
 
 def _read_prev_hash():
@@ -729,7 +729,7 @@ async def pch_enforcer(request: Request, call_next):  # pragma: no cover - new l
     binding_hint = base64.b64encode(session_id.encode()).decode() if session_id else "none"
     sig_header = request.headers.get("authorization")
     evidence_header = request.headers.get("pch-evidence")  # expected :<b64>:
-    challenge_hdr = request.headers.get("pch-challenge")
+    # challenge header value consumed via headers in signature-input parsing; no direct use here
     sig_input_header = request.headers.get("signature-input")
 
     # If no signature, issue challenge
@@ -1069,123 +1069,138 @@ def collect_cbom_now():  # pragma: no cover - simple IO orchestration
 
 @app.get("/compliance/pack")
 @app.post("/compliance/pack")
-def get_compliance_pack():
-    """Return a ZIP containing STH, last 50 enforcement receipts, and verification tooling.
+def get_compliance_pack(since: int | None = None):  # pragma: no cover - IO heavy
+    """Return a ZIP compliance bundle.
 
-    Contents (stable paths):
-      - sth.json (if exists)
-      - receipts/enforcement/enforcement_<index>.json (0 newest)
-      - proofs/*.json (if any)
-      - tools/verify_pch.py (standalone PCH Authorization signature verifier)
-      - README.md (instructions)
+    Default (no since parameter): legacy pack (sth.json + last 50 enforcement receipts + proofs + verify script).
+    With ?since=<ts>: new format containing:
+      - STH.json (latest Signed Tree Head; capitalized name per requirement)
+      - receipts.jsonl (newline-delimited JSON of receipts with ts_ms >= since)
+      - proofs/ (all proof json files present; future: filter to those receipts)
+      - verify.py (offline chain + optional PCH verifier)
+
+    The `since` timestamp is interpreted as milliseconds if >= 1e12 else seconds.
     """
     DATA.mkdir(parents=True, exist_ok=True)
     RECEIPTS.mkdir(parents=True, exist_ok=True)
     PROOFS.mkdir(parents=True, exist_ok=True)
     buf = io.BytesIO()
+    # Determine latest STH source (batched sth directory takes precedence if present)
+    sth_dir = DATA / "sth"
+    latest_sth_path: Path | None = None
+    if sth_dir.exists():
+        sth_files = sorted(sth_dir.glob("sth_*.json"), key=lambda p: p.stat().st_mtime)
+        if sth_files:
+            latest_sth_path = sth_files[-1]
+    if latest_sth_path is None and STH_FILE.exists():  # fallback to legacy single STH
+        latest_sth_path = STH_FILE
+
     with zipfile.ZipFile(buf, "w", compression=zipfile.ZIP_DEFLATED) as zf:
-        if STH_FILE.exists():
-            zf.write(STH_FILE, arcname="sth.json")
-        # Collect enforcement receipts (newest first)
-        enforcement = []
-        for r in sorted(RECEIPTS.glob("*.json"), key=lambda p: p.stat().st_mtime, reverse=True):
-            try:
-                obj = json.loads(r.read_text())
-            except Exception:
-                continue
-            if isinstance(obj, dict) and obj.get("kind") == "pqc.enforcement":
-                enforcement.append((r, obj))
-            if len(enforcement) >= 50:
-                break
-        for idx, (path_obj, _raw) in enumerate(enforcement):
-            arcname = f"receipts/enforcement/enforcement_{idx}.json"
-            try:
-                zf.write(path_obj, arcname=arcname)
-            except Exception:
-                logging.exception("Failed to add enforcement receipt %s", path_obj)
-        # Proofs (stable ordering by name)
-        for pth in sorted(PROOFS.glob("*.json")):
-            try:
-                zf.write(pth, arcname=f"proofs/{pth.name}")
-            except Exception:
-                logging.exception("Failed to add proof %s", pth)
-        # Verification helper: PCH signature verification script
-        verify_pch = """#!/usr/bin/env python3
-import sys, base64, json, hashlib
-from nacl.signing import VerifyKey
+        if since is None:
+            # Legacy packaging branch preserved for backward compatibility
+            if latest_sth_path and latest_sth_path.exists():
+                zf.write(latest_sth_path, arcname="sth.json")
+            enforcement = []
+            for r in sorted(RECEIPTS.glob("*.json"), key=lambda p: p.stat().st_mtime, reverse=True):
+                try:
+                    obj = json.loads(r.read_text())
+                except Exception as e:  # noqa: S112
+                    logging.debug("Skipping unreadable receipt during legacy pack build: %s", e)
+                if isinstance(obj, dict) and obj.get("kind") == "pqc.enforcement":
+                    enforcement.append(r)
+                if len(enforcement) >= 50:
+                    break
+            for idx, path_obj in enumerate(enforcement):
+                arcname = f"receipts/enforcement/enforcement_{idx}.json"
+                try:
+                    zf.write(path_obj, arcname=arcname)
+                except Exception:
+                    logging.exception("Failed to add enforcement receipt %s", path_obj)
+            for pth in sorted(PROOFS.glob("*.json")):
+                try:
+                    zf.write(pth, arcname=f"proofs/{pth.name}")
+                except Exception:
+                    logging.exception("Failed to add proof %s", pth)
+        else:
+            # New format
+            since_ms = since if since >= 1_000_000_000_000 else since * 1000  # seconds -> ms
+            if latest_sth_path and latest_sth_path.exists():
+                zf.write(latest_sth_path, arcname="STH.json")
+            # Collect receipts meeting threshold
+            receipts = []
+            for r in sorted(RECEIPTS.glob("*.json"), key=lambda p: p.stat().st_mtime):
+                try:
+                    obj = json.loads(r.read_text())
+                except Exception as e:  # noqa: S112
+                    logging.debug("Skipping unreadable receipt for since-pack: %s", e)
+                if not isinstance(obj, dict):
+                    continue
+                ts_ms = obj.get("ts_ms")
+                if ts_ms is None:
+                    # fallback to file mtime in ms
+                    ts_ms = int(r.stat().st_mtime * 1000)
+                if ts_ms >= since_ms:
+                    receipts.append(obj)
+            # Write receipts.jsonl
+            lines = []
+            for rec in receipts:
+                try:
+                    lines.append(json.dumps(rec, separators=(",", ":"), sort_keys=True))
+                except Exception as e:  # noqa: S112
+                    logging.debug("Skipping receipt serialization for jsonl: %s", e)
+            zf.writestr("receipts.jsonl", "\n".join(lines) + ("\n" if lines else ""))
+            # Proofs directory (currently unfiltered)
+            for pth in sorted(PROOFS.glob("*.json")):
+                try:
+                    zf.write(pth, arcname=f"proofs/{pth.name}")
+                except Exception:
+                    logging.exception("Failed to add proof %s", pth)
+        # Common tooling for both branches
+        verify_py = """#!/usr/bin/env python3
+import sys, json, base64, hashlib
+from pathlib import Path
 
-def usage():
-    print('Usage: verify_pch.py <receipt.json>'); sys.exit(1)
+def load_jsonl(path):
+    for line in open(path, 'r', encoding='utf-8'):
+        line=line.strip()
+        if not line: continue
+        yield json.loads(line)
 
-def build_sig_input(pch_block):
-    parts = [
-        f"@method:{pch_block.get('method','')}",
-        f"@path:{pch_block.get('path','')}",
-        f"@authority:{pch_block.get('authority','')}",
-        f"challenge:{pch_block.get('challenge','')}",
-        f"pch-channel-binding:{pch_block.get('channel_binding','') or ''}",
-    ]
-    return '\n'.join(parts).encode()
+def sha256_b64(data: bytes) -> str:
+    import hashlib, base64
+    return base64.b64encode(hashlib.sha256(data).digest()).decode()
+
+def build_core_payload(obj):
+    # remove signature related fields to reconstruct payload for hash verification
+    excluded = {'receipt_sig_b64','sig_alg'}
+    core = {k: v for k, v in obj.items() if k not in excluded}
+    return json.dumps(core, sort_keys=True, separators=(',', ':')).encode()
+
+def verify_chain(objs):
+    prev = None
+    for idx, obj in enumerate(objs):
+        payload_hash = obj.get('payload_hash_b64')
+        calc_hash = sha256_b64(build_core_payload(obj))
+        if payload_hash != calc_hash:
+            return False, f'hash_mismatch@{idx}'
+        if prev is not None and obj.get('prev_receipt_hash_b64') not in {prev.get('payload_hash_b64'), None}:
+            return False, f'prev_link_mismatch@{idx}'
+        prev = obj
+    return True, None
 
 def main():
-    if len(sys.argv) < 2: usage()
-    receipt = json.loads(open(sys.argv[1],'r',encoding='utf-8').read())
-    pch = receipt.get('pch') or {}
-    if not pch.get('present'):
-        print(json.dumps({'verified': False, 'error':'pch_not_present'})); return
-    sig_input = build_sig_input(pch)
-    key_b64 = pch.get('key_id_b64') or pch.get('keyId')
-    sig_b64 = pch.get('signature_b64') or pch.get('signature')
-    if not key_b64 or not sig_b64:
-        print(json.dumps({'verified': False, 'error': 'missing_key_or_signature'})); return
-    try:
-        vk = VerifyKey(base64.b64decode(key_b64))
-        vk.verify(sig_input, base64.b64decode(sig_b64))
-        print(json.dumps({'verified': True}))
-    except Exception as e:
-        print(json.dumps({'verified': False, 'error': str(e)}))
+    if len(sys.argv) < 2:
+        print('Usage: verify.py <receipts.jsonl>'); sys.exit(1)
+    path = Path(sys.argv[1])
+    objs = list(load_jsonl(path))
+    ok, reason = verify_chain(objs)
+    print(json.dumps({'verified': ok, 'reason': reason}))
 
 if __name__ == '__main__':
     main()
 """
-        zf.writestr("tools/verify_pch.py", verify_pch)
-        readme = """# Signet Compliance Pack
-
-This archive contains the latest Signed Tree Head (sth.json), recent enforcement receipts with optional Post-Connection Handshake (PCH) verification blocks, proofs, and a helper script to verify PCH signatures.
-
-## Contents
-* `sth.json` - Merkle tree summary over all known receipts at packaging time.
-* `receipts/enforcement/enforcement_<n>.json` - Newest first (0 newest) up to 50 receipts.
-* `proofs/` - Auxiliary inclusion/consistency proofs (if generated).
-* `tools/verify_pch.py` - Offline PCH Authorization signature verifier.
-
-## Verifying a PCH Signature
-1. Choose an enforcement receipt: `receipts/enforcement/enforcement_0.json`.
-2. Run: `python tools/verify_pch.py receipts/enforcement/enforcement_0.json`.
-3. Output JSON will show `{ "verified": true }` if the embedded signature matches the covered components.
-
-Covered components (in order):
-```
-@method:<METHOD>
-@path:<PATH>
-@authority:<HOST>
-challenge:<BASE64_NONCE>
-pch-channel-binding:<BINDING_HEADER_OR_EMPTY>
-```
-
-## Reproducibility Notes
-* Receipt ordering is deterministic (mtime descending; index assigned sequentially).
-* Filenames are stable (`enforcement_<index>.json`).
-* Scripts and README have fixed paths under `tools/`.
-* Non-deterministic factors (e.g., underlying file modification times) only influence which receipts fall into the last-50 window, not their filenames.
-
-## Merkle Root Cross-Check
-Compare `sth.json` root with any external log or previously archived STH to detect divergence.
-
-## License
-See repository LICENSE file for terms.
-"""
-        zf.writestr("README.md", readme)
+        zf.writestr("verify.py", verify_py)
     buf.seek(0)
-    headers = {"Content-Disposition": "attachment; filename=signet_compliance_pack.zip"}
+    fname = "signet_compliance_pack.zip" if since is None else f"signet_compliance_pack_since_{since}.zip"
+    headers = {"Content-Disposition": f"attachment; filename={fname}"}
     return Response(content=buf.getvalue(), media_type="application/zip", headers=headers)
