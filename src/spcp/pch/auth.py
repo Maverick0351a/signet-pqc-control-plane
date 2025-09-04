@@ -1,23 +1,22 @@
 from __future__ import annotations
 
 import base64
-from typing import Any, Dict, Tuple, Optional
 
 
-def parse_pch_authorization(header_value: str) -> Dict[str, str]:
-    """Parse an Authorization: PCH header into a dict of parameters.
+def parse_pch_authorization(header_value: str) -> dict[str, str]:
+        """Parse a ``Authorization: PCH`` header into parameters.
 
-    Expected format:
-        PCH keyId="<b64pub>", alg="ed25519", created="<epoch>", challenge="<nonce>", evidence="<b64>", signature="<b64>"
+        Expected token list (order not strict):
+            PCH keyId="<b64pub>", alg="ed25519", created="<epoch>", challenge="<nonce>", evidence="<b64>", signature="<b64>"
 
-    Returns empty dict if scheme isn't PCH or parse fails.
-    """
+        Returns empty dict on parse failure or non-PCH scheme.
+        """
     if not header_value:
         return {}
     parts = header_value.split(" ", 1)
     if len(parts) != 2 or parts[0].lower() != "pch":
         return {}
-    params: Dict[str, str] = {}
+    params: dict[str, str] = {}
     for seg in parts[1].split(","):
         if "=" not in seg:
             continue
@@ -26,7 +25,7 @@ def parse_pch_authorization(header_value: str) -> Dict[str, str]:
     return params
 
 
-def get_channel_binding(request) -> Tuple[Optional[str], Optional[bytes], Optional[str]]:
+def get_channel_binding(request) -> tuple[str | None, bytes | None, str | None]:
     """Extract and decode channel binding from headers.
 
     Looks at 'PCH-Channel-Binding'. Format:

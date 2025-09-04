@@ -1,7 +1,6 @@
 import base64
-import json
 import datetime as dt
-from typing import Optional
+import json
 
 from nacl import signing
 from nacl.encoding import RawEncoder
@@ -43,7 +42,7 @@ def _canonical_header_name(name: str) -> str:
     return name.lower()
 
 
-def _add_content_digest(prepared_request) -> Optional[str]:
+def _add_content_digest(prepared_request) -> str | None:
     body = prepared_request.body
     if not body:
         return None
@@ -118,7 +117,10 @@ def sign_http_request(
             header_value = _component_value(comp)
             lines.append(f"{comp}: {header_value}")
 
-    signature_input_value = f"sig1=(\"{'\" \"'.join(covered_components)}\");created={int(dt.datetime.utcnow().timestamp())}"  # noqa: E501
+    # Build signature-input value (avoid nested f-string quoting not available in py310)
+    created_ts = int(dt.datetime.utcnow().timestamp())
+    components_str = " ".join(f'"{c}"' for c in covered_components)
+    signature_input_value = f"sig1=({components_str});created={created_ts}"
 
     signature_base = "\n".join(lines) + f"\n{signature_input_value}"
 
@@ -127,8 +129,8 @@ def sign_http_request(
     key_material = ed25519_private_key_pem.strip()
     if "BEGIN" in key_material:
         # PEM format
-        pem_lines = [l for l in key_material.splitlines() if not l.startswith("---")]  # drop headers
-        b64_join = "".join(pem_lines)
+    pem_lines = [line for line in key_material.splitlines() if not line.startswith("---")]  # drop headers
+    b64_join = "".join(pem_lines)
         try:
             raw = base64.b64decode(b64_join)
             # PKCS8 Ed25519 private key structure: last 32 bytes typically the seed

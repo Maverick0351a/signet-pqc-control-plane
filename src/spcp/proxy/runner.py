@@ -9,7 +9,7 @@ import subprocess
 import threading
 import time
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any
 
 import httpx
 
@@ -19,7 +19,7 @@ TLS_SNAPSHOT_PATH = Path(os.getenv("TLS_SNAPSHOT_PATH", "/var/run/proxy_tls.json
 
 # State for change-detection gating (avoid reposting identical CBOMs)
 _last_cbom_emit: float = 0.0
-_last_cbom_digest: Optional[str] = None
+_last_cbom_digest: str | None = None
 
 
 def sha256_b64(b: bytes) -> str:
@@ -207,7 +207,7 @@ def proxy_config_fingerprint(
                     if brace_depth <= 0:
                         break
             # Filter comments and blank lines
-            filtered = [l for l in collected if l and not l.startswith("#")] if collected else []
+            filtered = [line for line in collected if line and not line.startswith("#")] if collected else []
             server_block_text = "\n".join(filtered).strip()
     except Exception:  # noqa: S112
         server_block_text = ""

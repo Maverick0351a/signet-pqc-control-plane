@@ -7,11 +7,15 @@ import logging
 import re
 import time
 from collections import OrderedDict
-from typing import Any, Dict, Tuple
+from typing import Any
 
 from ..settings import settings
 
-SIG_INPUT_RE = re.compile(r"^(?P<keyid>[^=]+)=\((?P<fields>[^)]*)\);created=(?P<created>\d+)(?:;nonce=(?P<nonce>[^;]+))?(?:;alg=(?P<alg>[^;]+))?$")
+SIG_INPUT_RE = re.compile(
+    r"^(?P<keyid>[^=]+)=\((?P<fields>[^)]*)\);created=(?P<created>\d+)"
+    r"(?:;nonce=(?P<nonce>[^;]+))?"
+    r"(?:;alg=(?P<alg>[^;]+))?$"
+)
 
 
 class NonceCache:
@@ -76,7 +80,10 @@ def _build_sig_base(sig_input: dict[str, Any], request: Any) -> bytes:
                 lines.append(f"{f}: ")
             else:
                 lines.append(f"{f}: {v}")
-    lines.append(f"@signature-params: {sig_input['key_id']}=({ ' '.join(sig_input['fields']) });created={sig_input['created']}")
+    fields_joined = " ".join(sig_input["fields"])
+    lines.append(
+        f"@signature-params: {sig_input['key_id']}=({fields_joined});created={sig_input['created']}"
+    )
     return "\n".join(lines).encode()
 
 

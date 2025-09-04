@@ -5,3 +5,13 @@ line-length = 100
 [lint]
 select = ["E", "F", "I", "B", "UP", "Q", "S", "PGH", "PTH", "C4"]
 ignore = ["S101"]
+
+# Per-file ignores: keep strictness in src while relaxing tests and certain helper scripts.
+# Rationale:
+#  - Tests: allow long lines and shell/process patterns for clarity of integration scenarios.
+#  - Handshake tailer: allow compact dict comprehension + slightly long lines.
+#  - Large API module: temporarily ignore E501 to avoid noisy refactor (can address incrementally).
+[lint.per-file-ignores]
+"tests/*.py" = ["E501", "E702", "S110", "S112", "S603", "S607", "S108", "PTH123", "C416"]
+"terminators/nginx-oqs/handshake_tailer.py" = ["E501", "C416"]
+"src/spcp/api/main.py" = ["E501"]
