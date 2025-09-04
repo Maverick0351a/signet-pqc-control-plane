@@ -1,8 +1,13 @@
+import base64
+import hashlib
+import json
+import shutil
+
 from fastapi.testclient import TestClient
-from spcp.api.main import app, DATA, RECEIPTS, STH_FILE
+
+from spcp.api.main import DATA, RECEIPTS, STH_FILE, app
 from spcp.proxy import cbom as cbom_mod
 from spcp.receipts.sign import verify_receipt_ed25519
-import json, shutil, base64, hashlib
 
 
 def setup_module():
@@ -22,8 +27,8 @@ def test_collect_cbom_stubbed(monkeypatch):
     # Use TestClient's .post through injection to avoid real network DNS lookup
     def _client_post(url, json, timeout):
         # url already includes base; strip base_url for TestClient relative path
-        assert url.endswith('/events')
-        resp = c.post('/events', json=json)
+        assert url.endswith("/events")
+        resp = c.post("/events", json=json)
         class R:
             def __init__(self, r):
                 self._r = r
@@ -33,12 +38,20 @@ def test_collect_cbom_stubbed(monkeypatch):
                 return self._r.json()
         return R(resp)
 
-    receipt = cbom_mod.collect_cbom(str(c.base_url).rstrip('/'), node_id="node-test-1", _post_func=_client_post)
+    receipt = cbom_mod.collect_cbom(
+        str(c.base_url).rstrip("/"),
+        node_id="node-test-1",
+        _post_func=_client_post,
+    )
     assert receipt["kind"] == "pqc.cbom"
     # Signature fields present
     for f in ("payload_hash_b64", "receipt_sig_b64", "sig_alg"):
         assert f in receipt
-    payload = {k: v for k, v in receipt.items() if k not in ("payload_hash_b64", "receipt_sig_b64", "sig_alg")}
+    payload = {
+        k: v
+        for k, v in receipt.items()
+        if k not in ("payload_hash_b64", "receipt_sig_b64", "sig_alg")
+    }
     assert payload["node_id"] == "node-test-1"
     assert payload["openssl_version"] == "3.2.1-test"
     entry = payload["entries"][0]
@@ -68,8 +81,12 @@ def test_collect_cbom_stubbed(monkeypatch):
     # Root consistency: recompute leaf hash and compare with inclusion in tree_size 1 case
     if sth["tree_size"] == 1:
         # Recompute leaf hash as done in _refresh_sth
-        core = {k: v for k, v in obj.items() if k not in ("payload_hash_b64", "receipt_sig_b64", "sig_alg")}
-        payload_bytes = json.dumps(core, sort_keys=True, separators=(',', ':')).encode()
+        core = {
+            k: v
+            for k, v in obj.items()
+            if k not in ("payload_hash_b64", "receipt_sig_b64", "sig_alg")
+        }
+        payload_bytes = json.dumps(core, sort_keys=True, separators=(",", ":")).encode()
         leaf_hash = hashlib.sha256(payload_bytes).digest()
         root_b64 = sth["root_sha256_b64"]
         assert base64.b64encode(leaf_hash).decode() == root_b64

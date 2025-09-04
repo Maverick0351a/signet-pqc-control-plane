@@ -1,8 +1,9 @@
 from __future__ import annotations
 
-import time
 import subprocess
-from typing import List, Dict, Any, Optional
+import time
+from typing import Any
+
 import httpx
 
 # Lightweight, stub-friendly runtime configuration attestation ("CBOM") helper.
@@ -10,13 +11,13 @@ import httpx
 # monkeypatch the private probe functions without invoking real system tools.
 
 
-def _run_cmd(args: List[str], timeout: float = 2.0) -> tuple[int, str, str]:
+def _run_cmd(args: list[str], timeout: float = 2.0) -> tuple[int, str, str]:
     """Execute a command safely (no shell) and capture output.
 
     Returns (returncode, stdout, stderr). Never raises; on failure returns (-1, "", msg).
     """
     try:
-        proc = subprocess.run(
+        proc = subprocess.run(  # noqa: S603 safe static args (no shell)
             args,
             capture_output=True,
             text=True,
@@ -24,15 +25,15 @@ def _run_cmd(args: List[str], timeout: float = 2.0) -> tuple[int, str, str]:
             check=False,
         )
         return proc.returncode, proc.stdout.strip(), proc.stderr.strip()
-    except FileNotFoundError as e:
+    except FileNotFoundError as e:  # pragma: no cover
         return -1, "", f"not found: {e}"
-    except subprocess.TimeoutExpired:
+    except subprocess.TimeoutExpired:  # pragma: no cover
         return -1, "", "timeout"
     except Exception as e:  # pragma: no cover (defensive)
         return -1, "", f"error: {e}"  # keep it opaque but recorded
 
 
-def _probe_openssl_version() -> Optional[str]:
+def _probe_openssl_version() -> str | None:
     rc, out, _ = _run_cmd(["openssl", "version"])
     if rc != 0 or not out:
         return None
@@ -40,7 +41,7 @@ def _probe_openssl_version() -> Optional[str]:
     return out.split()[1] if len(out.split()) >= 2 else out
 
 
-def _list_available_groups() -> List[str]:
+def _list_available_groups() -> list[str]:
     """Return a placeholder list of PQ/TLS groups.
 
     TODO: Extend to actually probe supported key exchange & KEM groups once
@@ -49,7 +50,7 @@ def _list_available_groups() -> List[str]:
     return ["x25519", "p256_kyber768", "x25519_kyber768"]
 
 
-def collect_cbom(api_url: str, node_id: str, *, _post_func=None) -> Dict[str, Any]:
+def collect_cbom(api_url: str, node_id: str, *, _post_func=None) -> dict[str, Any]:
     """Collect a minimal cryptographic BOM (CBOM) and POST as `pqc.cbom` event.
 
     Parameters

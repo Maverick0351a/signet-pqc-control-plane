@@ -1,8 +1,14 @@
 
+import base64
+import hashlib
+import json
+import shutil
+import time
+
 from fastapi.testclient import TestClient
-from spcp.api.main import app, DATA, RECEIPTS, STH_FILE
-from spcp.api.models import PolicyDoc
-import json, base64, hashlib, time, os, shutil
+
+from spcp.api.main import DATA, RECEIPTS, STH_FILE, app
+
 
 def setup_module():
     # Clean data dir
@@ -16,15 +22,25 @@ def test_policy_and_enforcement_flow():
     # Get default policy
     r = c.get("/policy")
     assert r.status_code == 200
-    cur = r.json()
+    r.json()  # consume
 
     # Update policy to v1 (hybrid)
-    new = {"version":"v1","allow_groups":["p256_kyber768"],"deny_groups":[],"mode":"hybrid","description":"pilot"}
+    new = {
+        "version": "v1",
+        "allow_groups": ["p256_kyber768"],
+        "deny_groups": [],
+        "mode": "hybrid",
+        "description": "pilot",
+    }
     r2 = c.put("/policy", json=new)
     assert r2.status_code == 200
 
     # Emit a pqc.enforcement (allowed case)
-    policy_hash_b64 = base64.b64encode(hashlib.sha256(json.dumps(new, sort_keys=True, separators=(',', ':')).encode()).digest()).decode()
+    policy_hash_b64 = base64.b64encode(
+        hashlib.sha256(
+            json.dumps(new, sort_keys=True, separators=(",", ":")).encode()
+        ).digest()
+    ).decode()
     e1 = {
         "kind": "pqc.enforcement",
         "ts_ms": int(time.time()*1000),
@@ -63,9 +79,9 @@ def test_circuit_breaker_trips_quickly(monkeypatch):
     """
     from spcp.settings import settings as live_settings
     # Monkeypatch settings
-    monkeypatch.setattr(live_settings, 'cb_window_size', 4)
-    monkeypatch.setattr(live_settings, 'cb_min_events', 4)
-    monkeypatch.setattr(live_settings, 'cb_error_rate_threshold', 0.5)
+    monkeypatch.setattr(live_settings, "cb_window_size", 4)
+    monkeypatch.setattr(live_settings, "cb_min_events", 4)
+    monkeypatch.setattr(live_settings, "cb_error_rate_threshold", 0.5)
     # Reinitialize circuit breaker in the app module to respect new settings window size
     import spcp.api.main as main_mod
     from spcp.policy.circuit_breaker import CircuitBreaker
@@ -79,10 +95,20 @@ def test_circuit_breaker_trips_quickly(monkeypatch):
     DATA.mkdir(parents=True, exist_ok=True)
 
     # Seed policy v1
-    base_policy = {"version":"v1","allow_groups":["grp"],"deny_groups":[],"mode":"pqc","description":"pilot"}
-    r = c.put('/policy', json=base_policy)
+    base_policy = {
+        "version": "v1",
+        "allow_groups": ["grp"],
+        "deny_groups": [],
+        "mode": "pqc",
+        "description": "pilot",
+    }
+    r = c.put("/policy", json=base_policy)
     assert r.status_code == 200
-    policy_hash_b64 = base64.b64encode(hashlib.sha256(json.dumps(base_policy, sort_keys=True, separators=(',', ':')).encode()).digest()).decode()
+    policy_hash_b64 = base64.b64encode(
+        hashlib.sha256(
+            json.dumps(base_policy, sort_keys=True, separators=(",", ":")).encode()
+        ).digest()
+    ).decode()
 
     def ev(allow: bool):
         return {
@@ -102,28 +128,28 @@ def test_circuit_breaker_trips_quickly(monkeypatch):
 
     # Two successes
     for _ in range(2):
-        assert c.post('/events', json=ev(True)).status_code == 200
+        assert c.post("/events", json=ev(True)).status_code == 200
     # Two failures
     for _ in range(2):
-        assert c.post('/events', json=ev(False)).status_code == 200
+        assert c.post("/events", json=ev(False)).status_code == 200
 
     # Expect a circuit-breaker policy downgrade receipt to exist (version suffix '-cb')
-    receipts = sorted(RECEIPTS.glob('*.json'))
+    receipts = sorted(RECEIPTS.glob("*.json"))
     names = [p.name for p in receipts]
-    downgrade = [n for n in names if 'policy_change_v1-cb' in n]
+    downgrade = [n for n in names if "policy_change_v1-cb" in n]
     assert downgrade, f"Expected downgrade receipt; found: {names}"
 
     # STH reflects all events + policy change (>=5 leaves)
     assert STH_FILE.exists()
     sth_obj = json.loads(STH_FILE.read_text())
-    assert sth_obj['tree_size'] >= 5
+    assert sth_obj["tree_size"] >= 5
 
     # Verify hash linking - after the first receipt that sets chain baseline
     import json as _json
     for p in receipts:
         obj = _json.loads(p.read_text())
         # Allow the very first policy.change (from_version v0) to lack prev link
-        if obj.get('prev_receipt_hash_b64') is None:
-            if obj.get('kind') == 'policy.change' and obj.get('from_version') == 'v0':
+        if obj.get("prev_receipt_hash_b64") is None:
+            if obj.get("kind") == "policy.change" and obj.get("from_version") == "v0":
                 continue
-        assert obj.get('prev_receipt_hash_b64') is not None, f"Missing prev hash in {p.name}"
+        assert obj.get("prev_receipt_hash_b64") is not None, f"Missing prev hash in {p.name}"

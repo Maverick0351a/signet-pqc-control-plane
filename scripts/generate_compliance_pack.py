@@ -16,11 +16,18 @@ Outputs:
 """
 from __future__ import annotations
 
-import base64, hashlib, json, time, shutil, subprocess, sys
+import base64
+import hashlib
+import json
+import shutil
+import subprocess
+import sys
+import time
 from pathlib import Path
+
 from fastapi.testclient import TestClient
 
-from spcp.api.main import app, DATA, RECEIPTS, STH_FILE
+from spcp.api.main import DATA, RECEIPTS, STH_FILE, app
 
 
 def main() -> int:
@@ -89,7 +96,10 @@ def main() -> int:
     zip_path = Path("compliance.zip")
     if zip_path.exists():
         zip_path.unlink()
-    ret = subprocess.run([sys.executable, "-m", "spcp.spcp_cli", "pack", "--out", str(zip_path)])
+    # Safe static args (bandit S603 justification): no untrusted input
+    ret = subprocess.run(  # noqa: S603 safe static args
+        [sys.executable, "-m", "spcp.spcp_cli", "pack", "--out", str(zip_path)]
+    )
     print("Pack exit code:", ret.returncode)
     print("ZIP present:", zip_path.exists())
     return ret.returncode

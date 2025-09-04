@@ -1,10 +1,16 @@
 
 from __future__ import annotations
-import json, zipfile
-from pathlib import Path
-from typing import Iterable
 
-def pack_compliance_zip(out_path: Path, receipts_dir: Path, sth_file: Path, proofs_dir: Path | None = None) -> Path:
+import zipfile
+from pathlib import Path
+
+
+def pack_compliance_zip(
+    out_path: Path,
+    receipts_dir: Path,
+    sth_file: Path,
+    proofs_dir: Path | None = None,
+) -> Path:
     out_path.parent.mkdir(parents=True, exist_ok=True)
     with zipfile.ZipFile(out_path, "w", compression=zipfile.ZIP_DEFLATED) as z:
         # Receipts
@@ -30,7 +36,11 @@ def main(root_dir):
     for n in names:
         with open(os.path.join(rec_dir, n), "r", encoding="utf-8") as f:
             obj = json.load(f)
-        core = {k: v for k, v in obj.items() if k not in ("payload_hash_b64", "receipt_sig_b64", "sig_alg")}
+        core = {
+            k: v
+            for k, v in obj.items()
+            if k not in ("payload_hash_b64", "receipt_sig_b64", "sig_alg")
+        }
         payload = json.dumps(core, sort_keys=True, separators=(',', ':')).encode()
         h = b64(sha256(payload))
         ok = (h == obj.get("payload_hash_b64"))

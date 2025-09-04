@@ -1,14 +1,19 @@
 
 from __future__ import annotations
-import time, httpx, hashlib, base64
-from typing import Dict, Any, Optional
+
+import base64
+import hashlib
+import time
+from typing import Any
+
+import httpx
+
 
 def sha256_b64(b: bytes) -> str:
-    import hashlib, base64
     return base64.b64encode(hashlib.sha256(b).digest()).decode()
 
 def emit_enforcement_event(api_url: str, policy_version: str, policy_hash_b64: str,
-                           negotiated: Dict[str, Any], allow: bool, reason: str | None = None):
+                           negotiated: dict[str, Any], allow: bool, reason: str | None = None):
     """Low-level helper to send a pre-built enforcement receipt.
 
     Parameters
@@ -41,7 +46,7 @@ def emit_enforcement_event(api_url: str, policy_version: str, policy_hash_b64: s
 
 def from_handshake(api_url: str, *, policy_version: str, policy_hash_b64: str,
                    tls_version: str, cipher: str, group_or_kem: str, sig_alg: str,
-                   sni: Optional[str], peer_ip: str, allow: bool, reason: Optional[str] = None):
+                   sni: str | None, peer_ip: str, allow: bool, reason: str | None = None):
     """Build and emit a `pqc.enforcement` receipt from raw handshake metadata.
 
     This is a convenience layer for proxies or tap scripts parsing TLS handshakes.

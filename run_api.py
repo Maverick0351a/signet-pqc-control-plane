@@ -4,7 +4,9 @@ Usage (from project root):
   python run_api.py
 """
 from __future__ import annotations
-import sys, pathlib
+
+import pathlib
+import sys
 
 ROOT = pathlib.Path(__file__).parent
 SRC = ROOT / "src"

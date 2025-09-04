@@ -1,14 +1,19 @@
 
 from __future__ import annotations
-import json, time, base64, hashlib
+
+import base64
+import hashlib
+import json
 from pathlib import Path
-from fastapi import FastAPI, HTTPException, Body
-from ..settings import settings
-from .models import PolicyDoc, PQCEnforcementReceipt, PQCCBOMReceipt
-from ..receipts.sign import sign_receipt_ed25519, verify_receipt_ed25519, sha256_b64
-from ..receipts.merkle import build_sth
-from ..policy.store import load_policy, set_policy
+
+from fastapi import Body, FastAPI, HTTPException
+
 from ..policy.circuit_breaker import CircuitBreaker
+from ..policy.store import load_policy, set_policy
+from ..receipts.merkle import build_sth
+from ..receipts.sign import sign_receipt_ed25519
+from ..settings import settings
+from .models import PolicyDoc, PQCCBOMReceipt, PQCEnforcementReceipt
 
 app = FastAPI(title="Signet PQC Control Plane (MVP)")
 
@@ -77,14 +82,15 @@ def _store_signed_receipt(name: str, signed: dict) -> Path:
     return p
 
 def _refresh_sth():
-    # recompute over all receipts in order
+    """Recompute STH over all receipts in insertion order."""
     files = sorted(RECEIPTS.glob("*.json"))
     leaves = []
     for f in files:
         obj = json.loads(f.read_text())
-        # leaf = sha256(payload) where payload excludes signature fields
-        core = {k: v for k, v in obj.items() if k not in ("payload_hash_b64", "receipt_sig_b64", "sig_alg")}
-        payload = json.dumps(core, sort_keys=True, separators=(',', ':')).encode()
+        # leaf = sha256(payload) excluding signature fields
+        excluded = ("payload_hash_b64", "receipt_sig_b64", "sig_alg")
+        core = {k: v for k, v in obj.items() if k not in excluded}
+        payload = json.dumps(core, sort_keys=True, separators=(",", ":")).encode()
         leaves.append(hashlib.sha256(payload).digest())
     leaves_b64 = [base64.b64encode(x).decode() for x in leaves]
     sth = build_sth(leaves_b64)
@@ -92,10 +98,10 @@ def _refresh_sth():
     return sth
 
 @app.post("/events")
-def post_event(body: dict = Body(...)):
+def post_event(body: dict = Body(...)):  # noqa: B008 FastAPI dependency pattern
     sk, vk = _load_keys()
     kind = body.get("kind")
-    # validate against pydantic models then sign with server key (control plane as aggregator/anchor)
+    # Validate & sign with server key (control plane as anchor)
     if kind == "pqc.enforcement":
         rec = PQCEnforcementReceipt.model_validate(body).model_dump()
     elif kind == "pqc.cbom":
@@ -106,13 +112,13 @@ def post_event(body: dict = Body(...)):
     rec["prev_receipt_hash_b64"] = _read_prev_hash()
     signed = sign_receipt_ed25519(rec, sk)
     # Sanitize hash fragment for filesystem (base64 can contain '/' '+')
-    hash_prefix = signed['payload_hash_b64'][:8].replace('/', '_').replace('+', '-')
+    hash_prefix = signed["payload_hash_b64"][:8].replace("/", "_").replace("+", "-")
     _store_signed_receipt(f"{kind.replace('.','_')}_{hash_prefix}", signed)
     _refresh_sth()
 
     # Feed circuit breaker with outcome if enforcement
     if kind == "pqc.enforcement":
-        _cb.add_outcome(bool(rec.get("decision",{}).get("allow", False)))
+        _cb.add_outcome(bool(rec.get("decision", {}).get("allow", False)))
         changed = _cb.maybe_trip(load_policy(), sk)
         if changed:
             _refresh_sth()

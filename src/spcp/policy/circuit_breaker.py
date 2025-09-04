@@ -1,14 +1,16 @@
 
 from __future__ import annotations
+
 from collections import deque
-from typing import Deque, Tuple, Optional
-from ..settings import settings
+
 from ..api.models import PolicyDoc
+from ..settings import settings
 from .store import set_policy
+
 
 class CircuitBreaker:
     def __init__(self):
-        self.window: Deque[bool] = deque(maxlen=settings.cb_window_size)
+        self.window: deque[bool] = deque(maxlen=settings.cb_window_size)
 
     def add_outcome(self, success: bool) -> None:
         self.window.append(success)
